@@ -1,26 +1,21 @@
+// The sylph CLI binary. Gated behind the `cli` feature: when sylph is built
+// as a static library for duckdb-miint, the binary disappears and only the
+// FFI surface remains. tikv-jemallocator was removed with the rest of the
+// musl-static-only allocator setup (see Cargo.toml comment).
+
+#[cfg(feature = "cli")]
 use clap::Parser;
+#[cfg(feature = "cli")]
 use sylph::cmdline::*;
+#[cfg(feature = "cli")]
 use sylph::sketch;
+#[cfg(feature = "cli")]
 use sylph::contain;
+#[cfg(feature = "cli")]
 use sylph::inspect;
-//use std::panic::set_hook;
 
-//Use this allocator when statically compiling
-//instead of the default
-//because the musl statically compiled binary
-//uses a bad default allocator which makes the
-//binary take 60% longer!!! Only affects
-//static compilation though. 
-#[cfg(target_env = "musl")]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
+#[cfg(feature = "cli")]
 fn main() {
-//    set_hook(Box::new(|info| {
-//        if let Some(s) = info.payload().downcast_ref::<String>() {
-//            log::error!("{}", s);
-//        }
-//    }));
     let cli = Cli::parse();
     match cli.mode {
         Mode::Sketch(sketch_args) => sketch::sketch(sketch_args),
@@ -28,4 +23,11 @@ fn main() {
         Mode::Profile(contain_args) => contain::contain(contain_args, true),
         Mode::Inspect(inspect_args) => inspect::inspect(inspect_args),
     }
+}
+
+#[cfg(not(feature = "cli"))]
+fn main() {
+    // No-op stub. The `cargo rustc --crate-type=staticlib` invocation used
+    // by duckdb-miint doesn't build main.rs, but cargo's check / test paths
+    // do, so a stub avoids spurious compile errors.
 }

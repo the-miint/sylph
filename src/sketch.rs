@@ -1,3 +1,4 @@
+#[cfg(feature = "cli")]
 use crate::cmdline::*;
 use scalable_cuckoo_filter::ScalableCuckooFilter;
 use scalable_cuckoo_filter::ScalableCuckooFilterBuilder;
@@ -5,15 +6,19 @@ use scalable_cuckoo_filter::ScalableCuckooFilterBuilder;
 use fxhash::FxHashMap;
 use fxhash::FxHashSet;
 use fxhash::FxHasher;
+#[cfg(feature = "cli")]
 use memory_stats::memory_stats;
 use std::fs;
+#[cfg(feature = "cli")]
 use std::thread;
+#[cfg(feature = "cli")]
 use std::time::Duration;
 
 use crate::constants::*;
 use crate::seeding::*;
 use crate::types::*;
 use log::*;
+#[cfg(feature = "fastx")]
 use needletail::parse_fastx_file;
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -24,6 +29,7 @@ use std::path::Path;
 use std::sync::Mutex;
 type Marker = u32;
 
+#[cfg(feature = "cli")]
 pub fn check_vram_and_block(max_ram: usize, file: &str) {
     if let Some(usage) = memory_stats() {
         let mut gb_usage_curr = usage.virtual_mem as f64 / 1_000_000_000 as f64;
@@ -120,6 +126,7 @@ pub fn is_fasta(file: &str) -> bool {
     }
 }
 
+#[cfg(feature = "cli")]
 fn check_args_valid(args: &SketchArgs) {
     let level;
     if args.trace {
@@ -161,6 +168,7 @@ fn check_args_valid(args: &SketchArgs) {
     }
 }
 
+#[cfg(feature = "cli")]
 fn parse_ambiguous_files(
     args: &SketchArgs,
     read_inputs: &mut Vec<String>,
@@ -188,6 +196,7 @@ fn parse_ambiguous_files(
     }
 }
 
+#[cfg(feature = "cli")]
 fn parse_reads_and_genomes(
     args: &SketchArgs,
     read_inputs: &mut Vec<String>,
@@ -215,6 +224,7 @@ fn parse_reads_and_genomes(
     }
 }
 
+#[cfg(feature = "cli")]
 fn parse_paired_end_reads(
     args: &SketchArgs,
     first_pairs: &mut Vec<String>,
@@ -257,6 +267,7 @@ fn parse_line_file(file_name: &str, vec: &mut Vec<String>) {
     }
 }
 
+#[cfg(feature = "cli")]
 fn parse_sample_names(args: &SketchArgs) -> Option<Vec<String>> {
     if args.list_sample_names.is_none() && args.sample_names.is_none() {
         return None;
@@ -273,6 +284,7 @@ fn parse_sample_names(args: &SketchArgs) -> Option<Vec<String>> {
     }
 }
 
+#[cfg(feature = "cli")]
 pub fn sketch(args: SketchArgs) {
     let mut read_inputs = vec![];
     let mut genome_inputs = vec![];
@@ -478,6 +490,7 @@ pub fn sketch(args: SketchArgs) {
     info!("Finished.");
 }
 
+#[cfg(feature = "fastx")]
 pub fn sketch_genome_individual(
     c: usize,
     k: usize,
@@ -548,6 +561,7 @@ pub fn sketch_genome_individual(
     }
 }
 
+#[cfg(feature = "fastx")]
 pub fn sketch_genome(
     c: usize,
     k: usize,
@@ -770,6 +784,7 @@ fn dup_removal_lsh_full(
     *c += 1;
 }
 
+#[cfg(feature = "fastx")]
 pub fn sketch_pair_sequences(
     read_file1: &str,
     read_file2: &str,
@@ -896,6 +911,7 @@ pub fn sketch_pair_sequences(
     return Some(read_sketch);
 }
 
+#[cfg(feature = "fastx")]
 pub fn sketch_sequences_needle(
     read_file: &str,
     c: usize,

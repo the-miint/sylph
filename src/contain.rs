@@ -1,6 +1,9 @@
+#[cfg(feature = "cli")]
 use crate::cmdline::*;
+#[cfg(feature = "cli")]
 use std::path::Path;
 use std::io::prelude::*;
+#[cfg(feature = "cli")]
 use std::io;
 use std::io::BufWriter;
 use fxhash::FxHashMap;
@@ -11,7 +14,9 @@ use crate::types::*;
 use log::*;
 use rayon::prelude::*;
 use statrs::distribution::{DiscreteCDF, Poisson};
+#[cfg(feature = "cli")]
 use std::fs::File;
+#[cfg(feature = "cli")]
 use std::io::BufReader;
 use std::sync::Mutex;
 
@@ -112,6 +117,7 @@ fn get_chunks(indices: &Vec<usize>, steps: usize) -> Vec<Vec<usize>>{
     return_chunks
 }
 
+#[cfg(feature = "cli")]
 pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
 
     if pseudotax_in{
@@ -491,6 +497,7 @@ fn print_header(pseudotax: bool, writer: &mut Box<dyn Write + Send>, estimate_un
     }
 }
 
+#[cfg(feature = "cli")]
 fn get_genome_sketches(
     args: &ContainArgs,
     genome_sketch_files: &Vec<&String>,
@@ -553,6 +560,7 @@ fn get_genome_sketches(
     return genome_sketches.into_inner().unwrap();
 }
 
+#[cfg(feature = "cli")]
 fn get_seq_sketch(
     args: &ContainArgs,
     read_file: &Vec<&String>,
@@ -610,6 +618,7 @@ fn get_seq_sketch(
     }
 }
 
+#[cfg(feature = "cli")]
 fn get_stats<'a>(
     args: &ContainArgs,
     genome_sketch: &'a GenomeSketch,
@@ -858,6 +867,7 @@ fn ani_from_lambda(lambda: Option<f64>, _mean: f64, k: f64, full_cov: &[u32]) ->
     return ret_ani;
 }
 
+#[cfg(feature = "cli")]
 fn bootstrap_interval(
     covs_full: &Vec<u32>,
     k: f64,

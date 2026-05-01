@@ -6,16 +6,30 @@ license = "MIT OR Apache-2.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[features]
+default = ["cli", "fastx"]
+# CLI/binary entry points and clap-derived arg types. Required by main.rs,
+# cmdline.rs, inspect.rs, and the orchestrator functions in sketch::sketch
+# and contain::contain. Off in the duckdb-miint static-lib build.
+cli = ["dep:clap", "dep:simple_logger", "fastx"]
+# Path-based read sketching via needletail. Required by sketch_genome,
+# sketch_pair_sequences, sketch_sequences_needle. Off in duckdb-miint
+# builds that sketch from in-memory byte slices via the FFI.
+fastx = ["dep:needletail"]
+
 [dependencies]
-needletail = "0.5.0"
-simple_logger=  { version = "3", features = ["stderr"] }
+needletail = { version = "0.5.0", optional = true }
+simple_logger = { version = "3", features = ["stderr"], optional = true }
 log = "0"
 rayon = "1"
 smallvec = { version = "1", features = ["union","serde","write"] }
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 fxhash = "0"
-clap = { version = "3", features = ["derive"] }
+clap = { version = "3", features = ["derive"], optional = true }
 flate2 = { version = "1.0.17", features = ["zlib-ng"], default-features = false }
 statrs="0.16"
 nalgebra="0"
@@ -26,9 +40,11 @@ memory-stats = "1"
 scalable_cuckoo_filter = "0.2"
 serde_yaml = "0.9"
 
-[target.'cfg(target_env = "musl")'.dependencies]
-tikv-jemallocator = "0"
-
+# Removed: tikv-jemallocator on musl. duckdb-miint's static-lib build links
+# into a host process that already owns the allocator (DuckDB's jemalloc on
+# most platforms); a second jemalloc would conflict. The upstream CLI binary
+# uses the system allocator instead — measured difference is small and only
+# matters for musl-static distributions, which we don't ship.
 
 [dev-dependencies]
 assert_cmd = "1.0.1"
@@ -37,7 +53,10 @@ serial_test = "*"
 
 
 [profile.release]
-panic = "abort"
+# Removed: panic = "abort". A panic across the FFI boundary in the
+# duckdb-miint static-lib build is undefined behaviour with abort, and the
+# c_api module relies on catch_unwind at every entry point. The upstream
+# CLI's release binary will be slightly larger; that's acceptable.
 lto = true
 
 [profile.dev]
