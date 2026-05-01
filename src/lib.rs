@@ -9,6 +9,7 @@ pub mod inference;
 #[cfg(feature = "cli")]
 pub mod inspect;
 pub mod profile_api;
+pub mod c_api;
 
 #[cfg(target_arch = "x86_64")]
 pub mod avx2_seeding;
