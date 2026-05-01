@@ -118,6 +118,36 @@ fn get_chunks(indices: &Vec<usize>, steps: usize) -> Vec<Vec<usize>>{
 }
 
 #[cfg(feature = "cli")]
+fn profile_args_from_contain_args(args: &ContainArgs) -> crate::profile_api::ProfileArgs {
+    use crate::profile_api::{LambdaEstimator, ProfileArgs};
+    let estimator = if args.mme {
+        LambdaEstimator::Mme
+    } else if args.nb {
+        LambdaEstimator::Nb
+    } else if args.mle {
+        LambdaEstimator::Mle
+    } else {
+        LambdaEstimator::Ratio
+    };
+    ProfileArgs {
+        estimator,
+        min_count_correct: args.min_count_correct,
+        min_number_kmers: args.min_number_kmers,
+        minimum_ani: args.minimum_ani,
+        pseudotax: args.pseudotax,
+        estimate_unknown: args.estimate_unknown,
+        estimate_read_counts: args.estimate_read_counts,
+        no_ci: args.no_ci,
+        no_adj: args.no_adj,
+        mean_coverage: args.mean_coverage,
+        seq_id: args.seq_id,
+        redundant_ani: args.redundant_ani,
+        log_reassignments: args.log_reassignments,
+        num_threads: 0, // CLI uses the rayon global pool already configured upstream.
+    }
+}
+
+#[cfg(feature = "cli")]
 pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
 
     if pseudotax_in{
@@ -291,10 +321,11 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
                     log::debug!("{} has estimated identity {:.3}.", &first_read_file, kmer_id_opt.unwrap().powf(1./sequence_sketch.k as f64) * 100.);
                 }
                 
+                let pa = profile_args_from_contain_args(&args);
                 let stats_vec_seq: Mutex<Vec<AniResult>> = Mutex::new(vec![]);
                 genome_index_vec.par_iter().for_each(|i| {
                     let genome_sketch = &genome_sketches[*i];
-                    let res = get_stats(&args, &genome_sketch, &sequence_sketch, None, args.log_reassignments);
+                    let res = get_stats(&pa, &genome_sketch, &sequence_sketch, None, args.log_reassignments);
                     if res.is_some() {
                         //res.as_mut().unwrap().genome_sketch_index = *i;
                         stats_vec_seq.lock().unwrap().push(res.unwrap());
@@ -311,7 +342,7 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
                     let remaining_genomes = stats_vec_seq.iter().map(|x| x.genome_sketch).collect::<Vec<&GenomeSketch>>();
                     let stats_vec_seq_2 = Mutex::new(vec![]);
                     remaining_genomes.into_par_iter().for_each(|genome_sketch|{
-                        let res = get_stats(&args, &genome_sketch, &sequence_sketch, Some(&winner_map), args.log_reassignments);
+                        let res = get_stats(&pa, &genome_sketch, &sequence_sketch, Some(&winner_map), args.log_reassignments);
                         if res.is_some() {
                             stats_vec_seq_2.lock().unwrap().push(res.unwrap());
                         }
@@ -368,7 +399,7 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
     log::info!("sylph finished.");
 }
 
-fn derep_if_reassign_threshold<'a>(results_old: &Vec<AniResult>, results_new: Vec<AniResult<'a>>, ani_thresh: f64, k: usize) -> Vec<AniResult<'a>>{
+pub(crate) fn derep_if_reassign_threshold<'a>(results_old: &Vec<AniResult>, results_new: Vec<AniResult<'a>>, ani_thresh: f64, k: usize) -> Vec<AniResult<'a>>{
     let ani_thresh = ani_thresh/100.;
 
     let mut gn_sketch_to_contain = FxHashMap::default();
@@ -392,7 +423,7 @@ fn derep_if_reassign_threshold<'a>(results_old: &Vec<AniResult>, results_new: Ve
     return return_vec;
 }
 
-fn estimate_true_cov(results: &mut Vec<AniResult>, kmer_id_opt: Option<f64>, 
+pub(crate) fn estimate_true_cov(results: &mut Vec<AniResult>, kmer_id_opt: Option<f64>,
                      estimate_unknown: bool, read_length: f64, k: usize){
     let mut multiplier = 1.;
     if estimate_unknown{
@@ -406,7 +437,7 @@ fn estimate_true_cov(results: &mut Vec<AniResult>, kmer_id_opt: Option<f64>,
     }
 }
 
-fn estimate_covered_bases(results: &Vec<AniResult>, sequence_sketch: &SequencesSketch, read_length: f64, k: usize) -> f64{
+pub(crate) fn estimate_covered_bases(results: &Vec<AniResult>, sequence_sketch: &SequencesSketch, read_length: f64, k: usize) -> f64{
     let multiplier = read_length / (read_length - (k as f64) + 1.);
 
     let mut num_covered_bases = 0.;
@@ -425,7 +456,7 @@ fn estimate_covered_bases(results: &Vec<AniResult>, sequence_sketch: &SequencesS
     return f64::min(num_covered_bases as f64 / num_tentative_bases, 1.);
 }
 
-fn winner_table<'a>(results : &'a Vec<AniResult>, log_reassign: bool) -> FxHashMap<Kmer, (f64,&'a GenomeSketch, bool)> {
+pub(crate) fn winner_table<'a>(results : &'a Vec<AniResult>, log_reassign: bool) -> FxHashMap<Kmer, (f64,&'a GenomeSketch, bool)> {
     let mut kmer_to_genome_map : FxHashMap<_,_> = FxHashMap::default();
     for res in results.iter(){
         //let gn_sketch = &genome_sketches[res.genome_sketch_index];
@@ -618,9 +649,8 @@ fn get_seq_sketch(
     }
 }
 
-#[cfg(feature = "cli")]
-fn get_stats<'a>(
-    args: &ContainArgs,
+pub(crate) fn get_stats<'a>(
+    args: &crate::profile_api::ProfileArgs,
     genome_sketch: &'a GenomeSketch,
     sequence_sketch: &SequencesSketch,
     winner_map: Option<&FxHashMap<Kmer, (f64,& GenomeSketch, bool)>>,
@@ -714,17 +744,12 @@ fn get_stats<'a>(
     if median_cov > MEDIAN_ANI_THRESHOLD {
         use_lambda = AdjustStatus::High
     } else {
-        let test_lambda;
-        if args.ratio {
-            test_lambda = ratio_lambda(&full_covs, args.min_count_correct)
-        } else if args.mme {
-            test_lambda = mme_lambda(&full_covs)
-        } else if args.nb {
-            test_lambda = binary_search_lambda(&full_covs)
-        } else if args.mle {
-            test_lambda = mle_zip(&full_covs, sequence_sketch.k as f64)
-        } else {
-            test_lambda = ratio_lambda(&full_covs, args.min_count_correct)
+        use crate::profile_api::LambdaEstimator;
+        let test_lambda = match args.estimator {
+            LambdaEstimator::Ratio => ratio_lambda(&full_covs, args.min_count_correct),
+            LambdaEstimator::Mme => mme_lambda(&full_covs),
+            LambdaEstimator::Nb => binary_search_lambda(&full_covs),
+            LambdaEstimator::Mle => mle_zip(&full_covs, sequence_sketch.k as f64),
         };
         if test_lambda.is_none() {
             use_lambda = AdjustStatus::Low
@@ -739,13 +764,10 @@ fn get_stats<'a>(
         final_est_cov = lam
     } else if median_cov < MAX_MEDIAN_FOR_MEAN_FINAL_EST{
         final_est_cov = geq1_mean_cov;
-    } else{
-        if args.mean_coverage{
-            final_est_cov = geq1_mean_cov;
-        }
-        else{
-            final_est_cov = median_cov;
-        }
+    } else if args.mean_coverage {
+        final_est_cov = geq1_mean_cov;
+    } else {
+        final_est_cov = median_cov;
     }
 
     let opt_lambda;
@@ -867,12 +889,12 @@ fn ani_from_lambda(lambda: Option<f64>, _mean: f64, k: f64, full_cov: &[u32]) ->
     return ret_ani;
 }
 
-#[cfg(feature = "cli")]
-fn bootstrap_interval(
+pub(crate) fn bootstrap_interval(
     covs_full: &Vec<u32>,
     k: f64,
-    args: &ContainArgs,
+    args: &crate::profile_api::ProfileArgs,
 ) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
+    use crate::profile_api::LambdaEstimator;
     fastrand::seed(7);
     let num_samp = covs_full.len();
     let iters = 100;
@@ -885,18 +907,12 @@ fn bootstrap_interval(
         for _ in 0..num_samp {
             rand_vec.push(covs_full[fastrand::usize(..covs_full.len())]);
         }
-        let lambda;
-        if args.ratio {
-            lambda = ratio_lambda(&rand_vec, args.min_count_correct);
-        } else if args.mme {
-            lambda = mme_lambda(&rand_vec);
-        } else if args.nb {
-            lambda = binary_search_lambda(&rand_vec);
-        } else if args.mle {
-            lambda = mle_zip(&rand_vec, k);
-        } else {
-            lambda = ratio_lambda(&rand_vec,args.min_count_correct);
-        }
+        let lambda = match args.estimator {
+            LambdaEstimator::Ratio => ratio_lambda(&rand_vec, args.min_count_correct),
+            LambdaEstimator::Mme => mme_lambda(&rand_vec),
+            LambdaEstimator::Nb => binary_search_lambda(&rand_vec),
+            LambdaEstimator::Mle => mle_zip(&rand_vec, k),
+        };
         let ani = ani_from_lambda(lambda, mean(&rand_vec).unwrap().into(), k, &rand_vec);
         if ani.is_some() && lambda.is_some() {
             if !ani.unwrap().is_nan() && !lambda.unwrap().is_nan() {
@@ -920,7 +936,7 @@ fn bootstrap_interval(
 }
 
 
-fn get_kmer_identity(seq_sketch: &SequencesSketch, estimate_unknown: bool) -> Option<f64>{
+pub(crate) fn get_kmer_identity(seq_sketch: &SequencesSketch, estimate_unknown: bool) -> Option<f64>{
 
     if !estimate_unknown{
         return None

@@ -35,7 +35,7 @@ use smallvec::SmallVec;
 use serde::{Deserialize, Serialize, Serializer, Deserializer, de::Visitor};
 use fxhash::FxHashMap;
 
-#[derive(Deserialize, Serialize, Debug, PartialEq)]
+#[derive(Deserialize, Serialize, Debug, PartialEq, Clone, Copy)]
 pub enum AdjustStatus {
     Lambda(f64),
     Low,
