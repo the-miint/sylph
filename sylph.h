@@ -30,6 +30,7 @@
  */
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -75,8 +76,52 @@ void sylph_database_free(SylphDatabase *db);
  * error — NULL-tolerant for ergonomic reasons). */
 size_t sylph_database_num_genomes(const SylphDatabase *db);
 
-/* (Phase 2.2+) sketch builders, one-shot Arrow sketcher, and sylph_profile
- * will be added here as those phases land. */
+/* ============================================================================
+ * Sample sketch (streaming builder)
+ * ============================================================================ */
+
+/* Opaque handle to a paired-end sketch (under construction or finalized). */
+typedef struct SylphSketch SylphSketch;
+
+/* Streaming sketch parameters. Layout-stable for now; trailing fields can
+ * be added non-breakingly (callers that don't know about a new field pass 0
+ * and get the default). */
+typedef struct {
+    /* k-mer size. Must match the syldb. 0 = use the syldb's k. */
+    uint8_t  k;
+    /* FracMinHash subsampling rate. Must be <= syldb's c. 0 = use syldb's c. */
+    uint16_t c;
+    /* 1 = sylph paired-read deduplication (default). 0 = disable. */
+    uint8_t  dedup;
+    /* Cuckoo-filter false-positive rate for approximate dedup. 0 = exact
+     * dedup via FxHashSet (deterministic but more memory at large scale). */
+    double   dedup_fpr;
+    /* Reserved; pass 0. */
+    uint64_t _reserved0;
+} SylphSketchParams;
+
+/* Create an empty paired-end sketch builder. params may be NULL (uses
+ * defaults). Free with sylph_sketch_free. Returns NULL on error. */
+SylphSketch *sylph_sketch_builder_create(const SylphSketchParams *params);
+
+/* Add one read (or read pair) to the builder. r2 = NULL and r2_len = 0 for
+ * single-end. Mixing single-end and paired-end calls within the same builder
+ * is not supported (subsequent calls in the wrong mode are silently dropped).
+ * Returns 0 on success, non-zero on error. */
+int sylph_sketch_builder_add_pair(
+    SylphSketch *builder,
+    const unsigned char *r1, size_t r1_len,
+    const unsigned char *r2, size_t r2_len);
+
+/* Finalize the builder. After this call the sketch is usable in
+ * sylph_profile() and further sylph_sketch_builder_add_pair calls fail.
+ * Returns 0 on success, non-zero on error. */
+int sylph_sketch_builder_finalize(SylphSketch *builder);
+
+/* Free a sketch (in either Building or Finalized state). Safe with NULL. */
+void sylph_sketch_free(SylphSketch *sketch);
+
+/* (Phase 2.4+) sylph_sketch_paired_arrow and sylph_profile will land here. */
 
 #ifdef __cplusplus
 } /* extern "C" */

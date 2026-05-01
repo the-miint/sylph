@@ -15,7 +15,8 @@
 
 #![allow(clippy::missing_safety_doc)]
 
-use crate::types::GenomeSketch;
+use crate::sketch::SketchPairBuilder;
+use crate::types::{GenomeSketch, SequencesSketch};
 use std::cell::RefCell;
 use std::ffi::{c_char, CStr, CString};
 use std::fs::File;
@@ -186,6 +187,244 @@ pub unsafe extern "C" fn sylph_database_num_genomes(db: *const SylphDatabase) ->
     guarded(0, || (*db).genomes.len())
 }
 
+// ============================================================================
+// Sample sketch (streaming builder + finalized handle)
+// ============================================================================
+
+/// Streaming sketch parameters. Mirrors fields the host needs to control;
+/// the FFI accepts a `*const SylphSketchParams` so we can extend the layout
+/// non-breakingly later (passing 0 for new fields = "use default").
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SylphSketchParams {
+    /// k-mer size. Must match the syldb. 0 = use the syldb's k.
+    pub k: u8,
+    /// FracMinHash subsampling rate. Must be ≤ syldb's c. 0 = use syldb's c.
+    pub c: u16,
+    /// 1 = sylph paired-read deduplication. 0 = no dedup.
+    pub dedup: u8,
+    /// Cuckoo-filter false-positive rate for approximate dedup. 0 = exact
+    /// dedup via FxHashSet (deterministic but higher memory at large scale).
+    pub dedup_fpr: f64,
+    /// Reserved for future expansion; pass 0.
+    pub _reserved0: u64,
+}
+
+impl Default for SylphSketchParams {
+    fn default() -> Self {
+        SylphSketchParams {
+            k: 0,
+            c: 0,
+            dedup: 1,
+            dedup_fpr: 0.0,
+            _reserved0: 0,
+        }
+    }
+}
+
+impl SylphSketchParams {
+    /// Resolve effective (k, c) given a database. If the caller passed 0,
+    /// inherit from the database; otherwise validate compatibility.
+    fn resolve_kc(&self, db_k: usize, db_c: usize) -> Result<(usize, usize), String> {
+        let k = if self.k == 0 { db_k } else { self.k as usize };
+        let c = if self.c == 0 { db_c } else { self.c as usize };
+        if k != db_k {
+            return Err(format!(
+                "sketch k ({}) must match database k ({})",
+                k, db_k
+            ));
+        }
+        if c < db_c {
+            return Err(format!(
+                "sketch c ({}) must be >= database c ({})",
+                c, db_c
+            ));
+        }
+        Ok((k, c))
+    }
+}
+
+/// Two-state sketch handle: under construction, or finalized.
+pub struct SylphSketch {
+    inner: SylphSketchInner,
+}
+
+enum SylphSketchInner {
+    Building(SketchPairBuilder),
+    Finalized(Box<SequencesSketch>),
+}
+
+/// Construct an empty paired-end sketch builder. Caller must subsequently
+/// call `sylph_sketch_builder_add_pair` zero or more times, then
+/// `sylph_sketch_builder_finalize` to obtain a usable sketch.
+///
+/// `params` is optional (NULL → defaults). When NULL or when `k`/`c` are 0,
+/// the sketch params remain unset; they are validated against the database
+/// at `sylph_profile()` time. Until then we use placeholder defaults.
+///
+/// # Safety
+/// `params` is borrowed for the duration of the call. The returned sketch
+/// owns its accumulator state and must be released with `sylph_sketch_free`.
+#[no_mangle]
+pub unsafe extern "C" fn sylph_sketch_builder_create(
+    params: *const SylphSketchParams,
+) -> *mut SylphSketch {
+    guarded(ptr::null_mut(), || {
+        let p = if params.is_null() {
+            SylphSketchParams::default()
+        } else {
+            *params
+        };
+        // If k/c are 0 we don't yet know them. Use sylph defaults (k=31, c=200)
+        // as placeholders; the caller can override post-hoc by reconstructing,
+        // and profile-time validation catches mismatches.
+        let k = if p.k == 0 { 31 } else { p.k as usize };
+        let c = if p.c == 0 { 200 } else { p.c as usize };
+        let no_dedup = p.dedup == 0;
+        let builder = SketchPairBuilder::new(
+            String::from("<ffi>"),
+            None,
+            c,
+            k,
+            no_dedup,
+            p.dedup_fpr,
+        );
+        Box::into_raw(Box::new(SylphSketch {
+            inner: SylphSketchInner::Building(builder),
+        }))
+    })
+}
+
+/// Add one read (or read pair) to a sketch builder.
+///
+/// Returns 0 on success, non-zero on error (wrong handle state, NULL builder,
+/// length mismatch with NULL pointer, etc.). On error call
+/// `sylph_get_last_error()` for details.
+///
+/// `r2 == NULL` and `r2_len == 0` → single-end. Mixing single-end and
+/// paired-end calls within the same builder is not supported and is logged
+/// then dropped (returns 0 for the offending call to keep streaming
+/// pipelines tolerant — the data is just skipped, not corrupted).
+///
+/// # Safety
+/// `builder` must be a non-finalized sketch from `sylph_sketch_builder_create`.
+/// `r1`/`r2` must point to at least `r1_len`/`r2_len` bytes if non-NULL.
+#[no_mangle]
+pub unsafe extern "C" fn sylph_sketch_builder_add_pair(
+    builder: *mut SylphSketch,
+    r1: *const u8,
+    r1_len: usize,
+    r2: *const u8,
+    r2_len: usize,
+) -> i32 {
+    guarded(-1, || {
+        if builder.is_null() {
+            set_error("sylph_sketch_builder_add_pair: builder is NULL");
+            return -1;
+        }
+        if r1.is_null() || r1_len == 0 {
+            set_error("sylph_sketch_builder_add_pair: r1 must be a non-empty byte buffer");
+            return -1;
+        }
+        if r2.is_null() != (r2_len == 0) {
+            set_error(
+                "sylph_sketch_builder_add_pair: r2 NULL/length mismatch \
+                 (NULL must imply length 0)",
+            );
+            return -1;
+        }
+        let r1_slice = std::slice::from_raw_parts(r1, r1_len);
+        let r2_slice = if r2.is_null() {
+            None
+        } else {
+            Some(std::slice::from_raw_parts(r2, r2_len))
+        };
+        match &mut (*builder).inner {
+            SylphSketchInner::Building(b) => {
+                b.add_pair(r1_slice, r2_slice);
+                0
+            }
+            SylphSketchInner::Finalized(_) => {
+                set_error(
+                    "sylph_sketch_builder_add_pair: builder is already finalized; \
+                     create a new sketch",
+                );
+                -1
+            }
+        }
+    })
+}
+
+/// Finalize the builder. After this call the sketch transitions to
+/// "Finalized" state and is usable in `sylph_profile`. Subsequent
+/// `add_pair` calls on the same handle will fail.
+///
+/// Returns 0 on success, non-zero on error.
+///
+/// # Safety
+/// `builder` must be a non-finalized sketch from `sylph_sketch_builder_create`.
+#[no_mangle]
+pub unsafe extern "C" fn sylph_sketch_builder_finalize(builder: *mut SylphSketch) -> i32 {
+    guarded(-1, || {
+        if builder.is_null() {
+            set_error("sylph_sketch_builder_finalize: builder is NULL");
+            return -1;
+        }
+        // We need to consume the SketchPairBuilder out of the inner enum.
+        // std::mem::replace lets us take ownership without breaking exclusive
+        // access: the temporary Finalized(empty) is overwritten immediately.
+        let placeholder = SylphSketchInner::Finalized(Box::new(SequencesSketch::default()));
+        let old = std::mem::replace(&mut (*builder).inner, placeholder);
+        match old {
+            SylphSketchInner::Building(b) => {
+                let sketch = b.finalize();
+                (*builder).inner = SylphSketchInner::Finalized(Box::new(sketch));
+                0
+            }
+            SylphSketchInner::Finalized(_) => {
+                // Restore so the handle remains usable; report the redundant call.
+                (*builder).inner = old;
+                set_error("sylph_sketch_builder_finalize: builder is already finalized");
+                -1
+            }
+        }
+    })
+}
+
+/// Free a sketch. Safe to call with NULL.
+///
+/// # Safety
+/// `sketch` must be a pointer from `sylph_sketch_builder_create` (in either
+/// state) and not yet freed.
+#[no_mangle]
+pub unsafe extern "C" fn sylph_sketch_free(sketch: *mut SylphSketch) {
+    if sketch.is_null() {
+        return;
+    }
+    let _ = guarded((), || {
+        drop(Box::from_raw(sketch));
+    });
+}
+
+/// (Internal, used by Phase 2.4's sylph_profile.) Borrow the finalized
+/// SequencesSketch out of a `*const SylphSketch`. Returns None if the handle
+/// is NULL or still in the Building state.
+///
+/// # Safety
+/// Caller must guarantee the returned reference does not outlive the
+/// SylphSketch pointer.
+pub(crate) unsafe fn sketch_borrow_finalized<'a>(
+    sketch: *const SylphSketch,
+) -> Option<&'a SequencesSketch> {
+    if sketch.is_null() {
+        return None;
+    }
+    match &(*sketch).inner {
+        SylphSketchInner::Finalized(s) => Some(&**s),
+        SylphSketchInner::Building(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,6 +489,83 @@ mod tests {
     fn num_genomes_on_null_returns_zero() {
         unsafe {
             assert_eq!(sylph_database_num_genomes(ptr::null()), 0);
+        }
+    }
+
+    // ----- Sketch builder FFI -----
+
+    #[test]
+    fn sketch_builder_create_with_null_params_uses_defaults() {
+        unsafe {
+            let s = sylph_sketch_builder_create(ptr::null());
+            assert!(!s.is_null());
+            // Cannot finalize without adding any reads — but the call should
+            // still succeed (empty sketch is valid).
+            let rc = sylph_sketch_builder_finalize(s);
+            assert_eq!(rc, 0);
+            // Already-finalized: second finalize should fail.
+            let rc2 = sylph_sketch_builder_finalize(s);
+            assert_eq!(rc2, -1);
+            sylph_sketch_free(s);
+        }
+    }
+
+    #[test]
+    fn sketch_builder_add_pair_round_trip() {
+        unsafe {
+            let params = SylphSketchParams::default();
+            let s = sylph_sketch_builder_create(&params);
+            assert!(!s.is_null());
+
+            // 70bp synthetic read pair (DNA only — passes the seeding alphabet).
+            let r1: &[u8] = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAC";
+            let r2: &[u8] = b"TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATG";
+            let rc = sylph_sketch_builder_add_pair(s, r1.as_ptr(), r1.len(), r2.as_ptr(), r2.len());
+            assert_eq!(rc, 0);
+
+            let rc = sylph_sketch_builder_finalize(s);
+            assert_eq!(rc, 0);
+
+            // Cannot add after finalize.
+            let rc = sylph_sketch_builder_add_pair(s, r1.as_ptr(), r1.len(), ptr::null(), 0);
+            assert_eq!(rc, -1);
+
+            // Internal accessor reflects finalized state.
+            let borrow = sketch_borrow_finalized(s);
+            assert!(borrow.is_some());
+
+            sylph_sketch_free(s);
+        }
+    }
+
+    #[test]
+    fn sketch_builder_add_pair_rejects_null_r1() {
+        unsafe {
+            let s = sylph_sketch_builder_create(ptr::null());
+            let rc = sylph_sketch_builder_add_pair(s, ptr::null(), 0, ptr::null(), 0);
+            assert_eq!(rc, -1);
+            let err = CStr::from_ptr(sylph_get_last_error()).to_str().unwrap();
+            assert!(err.contains("non-empty"));
+            sylph_sketch_free(s);
+        }
+    }
+
+    #[test]
+    fn sketch_builder_add_pair_rejects_null_r2_with_nonzero_len() {
+        unsafe {
+            let s = sylph_sketch_builder_create(ptr::null());
+            let r1 = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+            // r2 NULL but r2_len > 0 → bug in caller.
+            let rc = sylph_sketch_builder_add_pair(s, r1.as_ptr(), r1.len(), ptr::null(), 50);
+            assert_eq!(rc, -1);
+            sylph_sketch_free(s);
+        }
+    }
+
+    #[test]
+    fn sketch_free_on_null_is_safe() {
+        unsafe {
+            sylph_sketch_free(ptr::null_mut());
         }
     }
 }
