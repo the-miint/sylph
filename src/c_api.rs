@@ -425,6 +425,270 @@ pub(crate) unsafe fn sketch_borrow_finalized<'a>(
     }
 }
 
+// ============================================================================
+// Profile (Arrow C Data Interface output) — gated behind `arrow-ffi` feature
+// ============================================================================
+
+/// Profile parameters. Mirrors `profile_api::ProfileArgs` with C-compatible
+/// types. Layout-stable; new fields can be added at the end (callers passing
+/// the older struct shape get the default for new fields).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SylphProfileParams {
+    /// Lambda estimator selection: 0=Ratio (default), 1=MME, 2=NB, 3=MLE.
+    pub estimator: u8,
+    /// 1 = pseudotax / profile mode (default). 0 = query mode (no abundances).
+    pub pseudotax: u8,
+    /// 1 = renormalize to fraction-of-reads-explained.
+    pub estimate_unknown: u8,
+    /// 1 = report read counts instead of percent in seq_abund.
+    pub estimate_read_counts: u8,
+    /// 1 = skip 5/95 confidence interval bootstrap.
+    pub no_ci: u8,
+    /// 1 = skip lambda-based ANI adjustment.
+    pub no_adj: u8,
+    /// 1 = use mean coverage (instead of median) when median is high.
+    pub mean_coverage: u8,
+    /// 1 = log winner-take-all reassignments.
+    pub log_reassignments: u8,
+    pub min_count_correct: f64,
+    pub min_number_kmers: f64,
+    /// Minimum adjusted ANI (percent, 0..100). Negative = use sylph default.
+    pub minimum_ani: f64,
+    /// Sequence identity override (percent, 0..100). Negative = auto.
+    pub seq_id: f64,
+    /// Dereplication ANI for redundant-genome filtering.
+    pub redundant_ani: f64,
+    /// Number of rayon threads. 0 = use the global pool.
+    pub num_threads: u32,
+    /// Reserved for future expansion; pass 0.
+    pub _reserved0: u32,
+    pub _reserved1: u64,
+}
+
+impl Default for SylphProfileParams {
+    fn default() -> Self {
+        SylphProfileParams {
+            estimator: 0,
+            pseudotax: 1,
+            estimate_unknown: 0,
+            estimate_read_counts: 0,
+            no_ci: 0,
+            no_adj: 0,
+            mean_coverage: 0,
+            log_reassignments: 0,
+            min_count_correct: 3.0,
+            min_number_kmers: 50.0,
+            minimum_ani: -1.0,
+            seq_id: -1.0,
+            redundant_ani: crate::constants::DEREP_PROFILE_ANI,
+            num_threads: 0,
+            _reserved0: 0,
+            _reserved1: 0,
+        }
+    }
+}
+
+#[cfg(feature = "arrow-ffi")]
+impl SylphProfileParams {
+    fn to_profile_args(&self) -> crate::profile_api::ProfileArgs {
+        use crate::profile_api::{LambdaEstimator, ProfileArgs};
+        let estimator = match self.estimator {
+            1 => LambdaEstimator::Mme,
+            2 => LambdaEstimator::Nb,
+            3 => LambdaEstimator::Mle,
+            _ => LambdaEstimator::Ratio,
+        };
+        ProfileArgs {
+            estimator,
+            min_count_correct: self.min_count_correct,
+            min_number_kmers: self.min_number_kmers,
+            minimum_ani: if self.minimum_ani < 0.0 {
+                None
+            } else {
+                Some(self.minimum_ani)
+            },
+            pseudotax: self.pseudotax != 0,
+            estimate_unknown: self.estimate_unknown != 0,
+            estimate_read_counts: self.estimate_read_counts != 0,
+            no_ci: self.no_ci != 0,
+            no_adj: self.no_adj != 0,
+            mean_coverage: self.mean_coverage != 0,
+            seq_id: if self.seq_id < 0.0 { None } else { Some(self.seq_id) },
+            redundant_ani: self.redundant_ani,
+            log_reassignments: self.log_reassignments != 0,
+            num_threads: self.num_threads as usize,
+        }
+    }
+}
+
+/// Run the sylph profile compute pipeline against the given database and
+/// sample sketch, exporting the result as an Arrow RecordBatch over the
+/// Arrow C Data Interface (FFI).
+///
+/// On success, `out_array` and `out_schema` are populated with caller-owned
+/// pointers that must be released via the Arrow C Data Interface release
+/// callbacks (the standard FFI_ArrowArray::release / FFI_ArrowSchema::release
+/// fields on the structs themselves).
+///
+/// Output schema (9 columns, in order):
+///   0. genome_index (UInt32, nullable false)
+///   1. genome_name (LargeUtf8)
+///   2. contig_name (LargeUtf8)
+///   3. sequence_abundance (Float64, null when query mode)
+///   4. taxonomic_abundance (Float64, null when query mode)
+///   5. adjusted_ani (Float64)
+///   6. eff_cov (Float64)
+///   7. naive_ani (Float64)
+///   8. kmers_reassigned (UInt64, null when no winner-take-all pass)
+///
+/// Returns 0 on success, non-zero on error. Call sylph_get_last_error() for
+/// details. On error, out_array / out_schema are not populated.
+///
+/// # Safety
+/// `db` must be a valid SylphDatabase pointer (or NULL → error).
+/// `sample` must be a *finalized* SylphSketch (or NULL → error).
+/// `params` is borrowed for the duration of the call (NULL = defaults).
+/// `out_array` / `out_schema` must be valid uninitialized pointers to
+/// `arrow::ffi::FFI_ArrowArray` / `arrow::ffi::FFI_ArrowSchema` slots
+/// (typically via `MaybeUninit::uninit().as_mut_ptr()` in the caller).
+#[cfg(feature = "arrow-ffi")]
+#[no_mangle]
+pub unsafe extern "C" fn sylph_profile(
+    db: *const SylphDatabase,
+    sample: *const SylphSketch,
+    params: *const SylphProfileParams,
+    out_array: *mut arrow::ffi::FFI_ArrowArray,
+    out_schema: *mut arrow::ffi::FFI_ArrowSchema,
+) -> i32 {
+    guarded(-1, || {
+        if db.is_null() {
+            set_error("sylph_profile: db is NULL");
+            return -1;
+        }
+        if sample.is_null() {
+            set_error("sylph_profile: sample is NULL");
+            return -1;
+        }
+        if out_array.is_null() || out_schema.is_null() {
+            set_error("sylph_profile: out_array / out_schema must be non-NULL");
+            return -1;
+        }
+        let sample_ref = match sketch_borrow_finalized(sample) {
+            Some(s) => s,
+            None => {
+                set_error(
+                    "sylph_profile: sample sketch is not finalized; call \
+                     sylph_sketch_builder_finalize first",
+                );
+                return -1;
+            }
+        };
+        let pa = if params.is_null() {
+            SylphProfileParams::default().to_profile_args()
+        } else {
+            (*params).to_profile_args()
+        };
+        let results = crate::profile_api::run_profile_compute(
+            &(*db).genomes,
+            sample_ref,
+            &pa,
+        );
+        match owned_results_to_ffi(&results, out_array, out_schema) {
+            Ok(()) => 0,
+            Err(msg) => {
+                set_error(format!("sylph_profile: {}", msg));
+                -1
+            }
+        }
+    })
+}
+
+#[cfg(feature = "arrow-ffi")]
+fn owned_results_to_ffi(
+    results: &[crate::profile_api::OwnedAniResult],
+    out_array: *mut arrow::ffi::FFI_ArrowArray,
+    out_schema: *mut arrow::ffi::FFI_ArrowSchema,
+) -> Result<(), String> {
+    use arrow::array::{
+        Array, ArrayRef, Float64Array, LargeStringArray, StructArray, UInt32Array, UInt64Array,
+    };
+    use arrow::datatypes::{DataType, Field};
+    use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+    use std::sync::Arc;
+
+    let n = results.len();
+
+    let genome_index =
+        UInt32Array::from_iter_values((0..n).map(|i| i as u32));
+    let genome_name = LargeStringArray::from_iter_values(results.iter().map(|r| r.genome_name.as_str()));
+    let contig_name = LargeStringArray::from_iter_values(results.iter().map(|r| r.contig_name.as_str()));
+    let sequence_abundance = Float64Array::from_iter(results.iter().map(|r| r.sequence_abundance));
+    let taxonomic_abundance = Float64Array::from_iter(results.iter().map(|r| r.taxonomic_abundance));
+    let adjusted_ani = Float64Array::from_iter_values(results.iter().map(|r| r.adjusted_ani));
+    let eff_cov = Float64Array::from_iter_values(results.iter().map(|r| r.eff_cov));
+    let naive_ani = Float64Array::from_iter_values(results.iter().map(|r| r.naive_ani));
+    let kmers_reassigned = UInt64Array::from_iter(
+        results
+            .iter()
+            .map(|r| r.kmers_lost.map(|x| x as u64)),
+    );
+
+    let columns: Vec<(Arc<Field>, ArrayRef)> = vec![
+        (
+            Arc::new(Field::new("genome_index", DataType::UInt32, false)),
+            Arc::new(genome_index) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("genome_name", DataType::LargeUtf8, false)),
+            Arc::new(genome_name) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("contig_name", DataType::LargeUtf8, false)),
+            Arc::new(contig_name) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("sequence_abundance", DataType::Float64, true)),
+            Arc::new(sequence_abundance) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("taxonomic_abundance", DataType::Float64, true)),
+            Arc::new(taxonomic_abundance) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("adjusted_ani", DataType::Float64, false)),
+            Arc::new(adjusted_ani) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("eff_cov", DataType::Float64, false)),
+            Arc::new(eff_cov) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("naive_ani", DataType::Float64, false)),
+            Arc::new(naive_ani) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("kmers_reassigned", DataType::UInt64, true)),
+            Arc::new(kmers_reassigned) as ArrayRef,
+        ),
+    ];
+
+    let struct_array = StructArray::from(columns);
+    let array_data = struct_array.into_data();
+
+    let ffi_array = FFI_ArrowArray::new(&array_data);
+    let ffi_schema = FFI_ArrowSchema::try_from(array_data.data_type())
+        .map_err(|e| format!("FFI_ArrowSchema export: {}", e))?;
+
+    // Move into caller-provided slots. Caller's slot is treated as
+    // uninitialized memory — any pre-existing contents are overwritten.
+    unsafe {
+        std::ptr::write(out_array, ffi_array);
+        std::ptr::write(out_schema, ffi_schema);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

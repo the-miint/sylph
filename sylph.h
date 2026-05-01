@@ -121,7 +121,69 @@ int sylph_sketch_builder_finalize(SylphSketch *builder);
 /* Free a sketch (in either Building or Finalized state). Safe with NULL. */
 void sylph_sketch_free(SylphSketch *sketch);
 
-/* (Phase 2.4+) sylph_sketch_paired_arrow and sylph_profile will land here. */
+/* ============================================================================
+ * Profile (Arrow C Data Interface output)
+ *
+ * sylph_profile takes a loaded database + finalized sample sketch + params
+ * and returns a 9-column Arrow RecordBatch over the Arrow C Data Interface.
+ * The caller provides storage for FFI_ArrowArray and FFI_ArrowSchema slots
+ * (typically uninitialized stack/heap memory matching the Arrow C ABI
+ * struct layout). On success, sylph populates them; the caller must
+ * eventually invoke the structs' release callbacks.
+ *
+ * Output schema (in this column order):
+ *   genome_index (UInt32)            — index into the syldb
+ *   genome_name (LargeUtf8)          — GenomeSketch.file_name
+ *   contig_name (LargeUtf8)          — GenomeSketch.first_contig_name
+ *   sequence_abundance (Float64)     — fraction of effective coverage (sums to ~100), null in query mode
+ *   taxonomic_abundance (Float64)    — fraction of reads winner-take-all-assigned (sums to ~100), null in query mode
+ *   adjusted_ani (Float64)           — coverage-corrected containment ANI (0..1)
+ *   eff_cov (Float64)                — effective coverage estimate
+ *   naive_ani (Float64)              — raw containment ANI (0..1)
+ *   kmers_reassigned (UInt64)        — k-mers winner-take-all-assigned, null when no winner pass
+ *
+ * Forward-declare the Arrow C ABI structs without pulling Arrow headers.
+ * Layout matches the Arrow Columnar Format specification's Arrow C data
+ * interface.
+ * ============================================================================ */
+
+struct ArrowArray;
+struct ArrowSchema;
+
+/* Profile parameters. Layout-stable; trailing fields can be added without
+ * breaking older callers. Pass 0 / negative for "use default".
+ *   estimator: 0 = ratio (default), 1 = mme, 2 = nb, 3 = mle.
+ *   pseudotax: 1 = profile mode (default), 0 = query mode (no abundances).
+ *   minimum_ani / seq_id: pass < 0 to use sylph defaults.
+ */
+typedef struct {
+    uint8_t  estimator;
+    uint8_t  pseudotax;
+    uint8_t  estimate_unknown;
+    uint8_t  estimate_read_counts;
+    uint8_t  no_ci;
+    uint8_t  no_adj;
+    uint8_t  mean_coverage;
+    uint8_t  log_reassignments;
+    double   min_count_correct;
+    double   min_number_kmers;
+    double   minimum_ani;
+    double   seq_id;
+    double   redundant_ani;
+    uint32_t num_threads;
+    uint32_t _reserved0;
+    uint64_t _reserved1;
+} SylphProfileParams;
+
+/* Run profile and write the result into caller-provided Arrow C Data
+ * Interface slots. Returns 0 on success, non-zero on error. The sample
+ * sketch must be finalized (sylph_sketch_builder_finalize). */
+int sylph_profile(
+    const SylphDatabase *db,
+    const SylphSketch   *sample,
+    const SylphProfileParams *params,
+    struct ArrowArray  *out_array,
+    struct ArrowSchema *out_schema);
 
 #ifdef __cplusplus
 } /* extern "C" */
