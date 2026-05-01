@@ -568,4 +568,70 @@ mod tests {
             sylph_sketch_free(ptr::null_mut());
         }
     }
+
+    /// Phase 2.3 round-trip: feeding the FFI builder the same reads as
+    /// `sketch_pair_sequences` produces an identical kmer_counts map. Gated
+    /// behind `fastx` because the reference sketcher reads files.
+    #[cfg(feature = "fastx")]
+    #[test]
+    fn ffi_builder_matches_path_sketcher() {
+        use crate::sketch::sketch_pair_sequences;
+        use needletail::parse_fastx_file;
+
+        let r1_path = "test_files/k12_R1.fq";
+        let r2_path = "test_files/k12_R2.fq";
+        let k = 31usize;
+        let c = 200usize;
+
+        // Reference: path-based sketcher with exact dedup (dedup_fpr = 0.0).
+        let path_sketch = sketch_pair_sequences(r1_path, r2_path, c, k, None, false, 0.0)
+            .expect("path sketcher");
+
+        // Slurp paired reads into Vec<Vec<u8>> for FFI feeding.
+        fn slurp(p: &str) -> Vec<Vec<u8>> {
+            let mut r = parse_fastx_file(p).expect("parse_fastx_file");
+            let mut out = Vec::new();
+            while let Some(rec) = r.next() {
+                out.push(rec.expect("record").seq().into_owned());
+            }
+            out
+        }
+        let r1s = slurp(r1_path);
+        let r2s = slurp(r2_path);
+        assert_eq!(r1s.len(), r2s.len());
+
+        unsafe {
+            let params = SylphSketchParams {
+                k: 31,
+                c: 200,
+                dedup: 1,
+                dedup_fpr: 0.0, // match the path sketcher's exact-dedup mode
+                _reserved0: 0,
+            };
+            let s = sylph_sketch_builder_create(&params);
+            assert!(!s.is_null());
+            for (r1, r2) in r1s.iter().zip(r2s.iter()) {
+                let rc = sylph_sketch_builder_add_pair(
+                    s,
+                    r1.as_ptr(),
+                    r1.len(),
+                    r2.as_ptr(),
+                    r2.len(),
+                );
+                assert_eq!(rc, 0, "add_pair failed");
+            }
+            let rc = sylph_sketch_builder_finalize(s);
+            assert_eq!(rc, 0, "finalize failed");
+
+            let ffi_sketch = sketch_borrow_finalized(s).expect("finalized borrow");
+            assert_eq!(
+                path_sketch.kmer_counts, ffi_sketch.kmer_counts,
+                "FFI sketch kmer_counts must match the path sketcher"
+            );
+            assert_eq!(path_sketch.k, ffi_sketch.k);
+            assert_eq!(path_sketch.c, ffi_sketch.c);
+
+            sylph_sketch_free(s);
+        }
+    }
 }
