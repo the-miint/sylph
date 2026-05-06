@@ -216,7 +216,12 @@ impl Default for SylphSketchParams {
             k: 0,
             c: 0,
             dedup: 1,
-            dedup_fpr: 0.0,
+            // Match sylph CLI's `--fpr` default (DEFAULT_FPR = 0.0001) so a
+            // C/C++ caller using sylph_sketch_params_default() gets the same
+            // approximate-cuckoo-filter behavior as `sylph profile`. Earlier
+            // value was 0.0 (exact FxHashSet dedup) — deterministic but
+            // disagreed with the CLI default and confused FFI consumers.
+            dedup_fpr: crate::constants::DEFAULT_FPR,
             _reserved0: 0,
         }
     }
@@ -520,6 +525,36 @@ impl SylphProfileParams {
             num_threads: self.num_threads as usize,
         }
     }
+}
+
+/// Populate `out` with sylph's default profile parameters. C/C++ callers
+/// should always seed a `SylphProfileParams` struct via this function rather
+/// than zero-initializing — sylph has several non-zero defaults (e.g.
+/// `pseudotax = 1`, `redundant_ani = 99.0`, `seq_id = -1.0`) that a fresh
+/// zero-init struct would otherwise silently miss.
+///
+/// Returns 0 on success, non-zero on a NULL `out`.
+#[no_mangle]
+pub unsafe extern "C" fn sylph_profile_params_default(out: *mut SylphProfileParams) -> i32 {
+    if out.is_null() {
+        return 1;
+    }
+    *out = SylphProfileParams::default();
+    0
+}
+
+/// Populate `out` with sylph's default sketch parameters. Same rationale as
+/// `sylph_profile_params_default` — non-zero defaults (`dedup = 1`,
+/// `dedup_fpr = DEFAULT_FPR (0.0001)`) get silently lost on a zero-init.
+///
+/// Returns 0 on success, non-zero on a NULL `out`.
+#[no_mangle]
+pub unsafe extern "C" fn sylph_sketch_params_default(out: *mut SylphSketchParams) -> i32 {
+    if out.is_null() {
+        return 1;
+    }
+    *out = SylphSketchParams::default();
+    0
 }
 
 /// Run the sylph profile compute pipeline against the given database and

@@ -175,6 +175,19 @@ typedef struct {
     uint64_t _reserved1;
 } SylphProfileParams;
 
+/* Populate `out` with sylph's default profile parameters. C/C++ callers
+ * should always seed a SylphProfileParams via this function rather than
+ * zero-initializing — sylph has several non-zero defaults (pseudotax = 1,
+ * redundant_ani = 99.0, seq_id = -1.0, ...) that a zero-init struct would
+ * silently miss. Returns 0 on success, non-zero if `out` is NULL. */
+int sylph_profile_params_default(SylphProfileParams *out);
+
+/* Populate `out` with sylph's default sketch parameters. Same rationale —
+ * dedup = 1 and dedup_fpr = 0.0001 (matches sylph CLI's --fpr default) are
+ * non-zero and would be silently lost on a zero-init. Returns 0 on success,
+ * non-zero if `out` is NULL. */
+int sylph_sketch_params_default(SylphSketchParams *out);
+
 /* Run profile and write the result into caller-provided Arrow C Data
  * Interface slots. Returns 0 on success, non-zero on error. The sample
  * sketch must be finalized (sylph_sketch_builder_finalize). */

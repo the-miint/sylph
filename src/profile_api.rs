@@ -129,7 +129,12 @@ impl OwnedAniResult {
             genome_name: r.gn_name.to_string(),
             contig_name: r.contig_name.to_string(),
             seq_name: r.seq_name.clone(),
-            adjusted_ani: r.final_est_ani,
+            // Clamp to 1.0 (= 100% ANI) to match the CLI's print path
+            // (`f64::min(... * 100., 100.)` in contain.rs). Lambda correction
+            // can push final_est_ani slightly past 1.0 on borderline-detected
+            // genomes; sylph CLI hides this in display, so the FFI does too
+            // for output equivalence.
+            adjusted_ani: r.final_est_ani.min(1.0),
             naive_ani: r.naive_ani,
             eff_cov: r.final_est_cov,
             mean_cov: r.mean_cov,

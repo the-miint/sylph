@@ -10,7 +10,14 @@ pub const SAMPLE_FILE_SUFFIX_VALID : [&str;2] = [SAMPLE_FILE_SUFFIX, ".sylsample
 pub const MIN_ANI_DEF: f64 = 0.9;
 pub const MIN_ANI_P_DEF: f64 = 0.95;
 pub const MAX_MEDIAN_FOR_MEAN_FINAL_EST: f64 = 15.;
-pub const DEREP_PROFILE_ANI: f64 = 0.975;
+// Redundancy threshold for `sylph profile`'s genome dereplication. Carried
+// on the percentage scale (e.g. 99.0 ≈ 99% ANI) — `derep_if_reassign_threshold`
+// in contain.rs divides by 100 internally. Must agree with the CLI default
+// `default_value_t = 99.0` on `--redundancy-threshold` in cmdline.rs (clap 3
+// won't let us reference a const there). Earlier value was 0.975, which
+// yielded an effective threshold of ~0.975% inside the function — i.e. zero —
+// and collapsed nearly every detected genome on the FFI path.
+pub const DEREP_PROFILE_ANI: f64 = 99.0;
 pub const MAX_DEDUP_COUNT: u32 = 4;
 pub const MAX_DEDUP_LEN: usize = 10000000;
 pub const DEFAULT_FPR: f64 = 0.0001;
