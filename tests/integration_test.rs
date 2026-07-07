@@ -5,16 +5,18 @@ use std::path::Path;
 use serial_test::serial;
 use std::process::Command; // Run programs
 
-fn fresh(){
-    Command::new("rm")
-        .arg("-r")
-        .args(["./tests/results/test_sketch_dir"])
-        .spawn();
+fn fresh() {
+    // Synchronously reset the output dir (the old spawned `rm` raced and never
+    // recreated it, so commands wrote into a missing dir).
+    let dir = "./tests/results/test_sketch_dir";
+    let _ = fs::remove_dir_all(dir);
+    fs::create_dir_all(dir).expect("create test output dir");
 }
 
 #[serial]
 #[test]
 fn test_sketch_commands() {
+    fresh();
    let mut cmd = Command::cargo_bin("sylph").unwrap();
     let assert = cmd
         .arg("sketch")
@@ -376,6 +378,7 @@ fn test_sample_names(){
 #[serial]
 #[test]
 fn test_fpr(){
+    fresh();
     let mut cmd = Command::cargo_bin("sylph").unwrap();
     let assert = cmd
         .arg("sketch")
@@ -383,9 +386,8 @@ fn test_fpr(){
         .arg("test_files/t1.fq")
         .arg("-2")
         .arg("test_files/t2.fq")
-        .arg("-d ")
+        .arg("-d")
         .arg("./tests/results/test_sketch_dir")
-        .arg("0")
         .assert();
     assert.success().code(0);
     fresh();
@@ -510,7 +512,7 @@ fn test_estimate_read_counts(){
 #[serial]
 #[test]
 fn test_raw_inputs_profile_with_sketch(){
-    
+    fresh();
     let mut output = Command::cargo_bin("sylph").unwrap();
     let output = output
         .arg("profile")
@@ -550,6 +552,7 @@ fn test_raw_inputs_profile_with_sketch(){
 #[serial]
 #[test]
 fn test_inspect(){
+    fresh();
    let mut cmd = Command::cargo_bin("sylph").unwrap();
     let assert = cmd
         .arg("sketch")
