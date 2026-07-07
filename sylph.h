@@ -122,6 +122,76 @@ int sylph_sketch_builder_finalize(SylphSketch *builder);
 void sylph_sketch_free(SylphSketch *sketch);
 
 /* ============================================================================
+ * Index builder (build + write a .syldb)
+ *
+ * The mirror image of the sample sketch builder: sketches reference genomes
+ * into a database and serializes it to a `.syldb` (the format
+ * sylph_database_load reads). Lifecycle:
+ *
+ *   create -> { begin_genome -> add_contig* -> end_genome }* -> write -> free
+ *
+ * One genome is under construction at a time; the host groups its reference
+ * table by a genome-key column and feeds each genome's contigs contiguously.
+ * NOT thread-safe — one builder per thread.
+ * ============================================================================ */
+
+/* Opaque handle to a database under construction. */
+typedef struct SylphIndexBuilder SylphIndexBuilder;
+
+/* Reference-genome sketch parameters. Layout-stable; trailing fields can be
+ * added non-breakingly (pass 0 for "use default"). */
+typedef struct {
+    /* k-mer size. 0 = default 31. Only 21 and 31 are supported. */
+    uint8_t  k;
+    /* FracMinHash subsampling rate. 0 = default 200. */
+    uint16_t c;
+    /* Minimum k-mer spacing. 0 = default 30. */
+    uint32_t min_spacing;
+    /* 1 = track min-spacing-dropped k-mers for pseudotax/profiling (default).
+     * 0 = do not (query-only databases). */
+    uint8_t  pseudotax;
+    /* Reserved; pass 0. */
+    uint64_t _reserved0;
+} SylphGenomeSketchParams;
+
+/* Populate `out` with sylph's default reference-genome sketch parameters. Seed
+ * a SylphGenomeSketchParams via this rather than zero-initializing — pseudotax
+ * = 1 is a non-zero default. Returns 0 on success, non-zero if `out` is NULL. */
+int sylph_genome_sketch_params_default(SylphGenomeSketchParams *out);
+
+/* Create an index builder. params may be NULL (defaults). Returns NULL on
+ * error (e.g. unsupported k); call sylph_get_last_error(). Free with
+ * sylph_index_builder_free. */
+SylphIndexBuilder *sylph_index_builder_create(const SylphGenomeSketchParams *params);
+
+/* Begin a new reference genome. file_name is the genome's identity in the
+ * `.syldb` (may be NULL -> empty). Errors if a previous genome is still open.
+ * Returns 0 on success, non-zero on error. */
+int sylph_index_builder_begin_genome(SylphIndexBuilder *builder, const char *file_name);
+
+/* Add one contig to the open genome. contig_name may be NULL (only the first
+ * contig's name is retained). seq must be non-NULL (seq_len 0 permitted).
+ * Errors if no genome is open. Returns 0 on success, non-zero on error. */
+int sylph_index_builder_add_contig(SylphIndexBuilder *builder, const char *contig_name,
+                                   const unsigned char *seq, size_t seq_len);
+
+/* Finalize the open genome into a GenomeSketch and append it to the database.
+ * Errors if no genome is open. Returns 0 on success, non-zero on error. */
+int sylph_index_builder_end_genome(SylphIndexBuilder *builder);
+
+/* Number of completed genomes (an in-progress genome is not counted). Returns
+ * 0 if builder is NULL. */
+size_t sylph_index_builder_num_genomes(const SylphIndexBuilder *builder);
+
+/* Serialize the accumulated genomes to `path` as a `.syldb`. Errors if a
+ * genome is still open, if no genomes were added, or on I/O failure. Returns 0
+ * on success, non-zero on error. */
+int sylph_index_builder_write(SylphIndexBuilder *builder, const char *path);
+
+/* Free an index builder. Safe to call with NULL. */
+void sylph_index_builder_free(SylphIndexBuilder *builder);
+
+/* ============================================================================
  * Profile (Arrow C Data Interface output)
  *
  * sylph_profile takes a loaded database + finalized sample sketch + params
