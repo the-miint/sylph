@@ -15,7 +15,7 @@
 
 #![allow(clippy::missing_safety_doc)]
 
-use crate::sketch::SketchPairBuilder;
+use crate::builders::SketchPairBuilder;
 use crate::types::{GenomeSketch, SequencesSketch};
 use std::cell::RefCell;
 use std::ffi::{c_char, CStr, CString};
