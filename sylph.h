@@ -128,10 +128,13 @@ void sylph_sketch_free(SylphSketch *sketch);
  * into a database and serializes it to a `.syldb` (the format
  * sylph_database_load reads). Lifecycle:
  *
- *   create -> { begin_genome -> add_contig* -> end_genome }* -> write -> free
+ *   create -> add_contig(genome_id, order, ...)* -> end_genome(genome_id) ... -> merge* -> write -> free
  *
- * One genome is under construction at a time; the host groups its reference
- * table by a genome-key column and feeds each genome's contigs contiguously.
+ * Contigs are addressed by genome_id, so the builder keeps one in-progress sketch
+ * per open genome id and different genomes' contigs may be interleaved. Add a
+ * genome's contigs then call end_genome to finalize + free it. `order` fixes only
+ * first_contig_name (the lowest-order contig), so results match `sylph sketch`.
+ * merge combines per-thread builders before a single write.
  * NOT thread-safe — one builder per thread.
  * ============================================================================ */
 
@@ -164,28 +167,34 @@ int sylph_genome_sketch_params_default(SylphGenomeSketchParams *out);
  * sylph_index_builder_free. */
 SylphIndexBuilder *sylph_index_builder_create(const SylphGenomeSketchParams *params);
 
-/* Begin a new reference genome. file_name is the genome's identity in the
- * `.syldb` (may be NULL -> empty). Errors if a previous genome is still open.
+/* Add one contig to the genome identified by genome_id (created on first sight).
+ * genome_id must be non-NULL — it is the genome's identity in the `.syldb`.
+ * `order` orders contigs within the genome; the lowest-order contig supplies
+ * first_contig_name (pass the source contig index / sequence_index to match
+ * `sylph sketch`). contig_name may be NULL (-> empty). seq must be non-NULL
+ * (seq_len 0 permitted). Contigs of different genomes may be interleaved.
  * Returns 0 on success, non-zero on error. */
-int sylph_index_builder_begin_genome(SylphIndexBuilder *builder, const char *file_name);
+int sylph_index_builder_add_contig(SylphIndexBuilder *builder, const char *genome_id, int64_t order,
+                                   const char *contig_name, const unsigned char *seq, size_t seq_len);
 
-/* Add one contig to the open genome. contig_name may be NULL (only the first
- * contig's name is retained). seq must be non-NULL (seq_len 0 permitted).
- * Errors if no genome is open. Returns 0 on success, non-zero on error. */
-int sylph_index_builder_add_contig(SylphIndexBuilder *builder, const char *contig_name,
-                                   const unsigned char *seq, size_t seq_len);
+/* Finalize the single in-progress genome `genome_id`, freeing its marker buffer
+ * immediately. A host streaming a genome-id-clustered source calls this the
+ * moment a genome's rows end, so peak memory stays ~the finalized sketches.
+ * Errors if no open genome has that id. Returns 0 on success, non-zero on error. */
+int sylph_index_builder_end_genome(SylphIndexBuilder *builder, const char *genome_id);
 
-/* Finalize the open genome into a GenomeSketch and append it to the database.
- * Errors if no genome is open. Returns 0 on success, non-zero on error. */
-int sylph_index_builder_end_genome(SylphIndexBuilder *builder);
-
-/* Number of completed genomes (an in-progress genome is not counted). Returns
- * 0 if builder is NULL. */
+/* Number of completed genomes (in-progress genomes are not counted until
+ * end_genome). Returns 0 if builder is NULL. */
 size_t sylph_index_builder_num_genomes(const SylphIndexBuilder *builder);
 
-/* Serialize the accumulated genomes to `path` as a `.syldb`. Errors if a
- * genome is still open, if no genomes were added, or on I/O failure. Returns 0
- * on success, non-zero on error. */
+/* Move all completed genomes from `src` into `dst` (src ends empty). For merging
+ * per-thread builders before a single write. Both must have no open genome (call
+ * end_genome for each first). Returns 0 on success, non-zero on error. */
+int sylph_index_builder_merge(SylphIndexBuilder *dst, SylphIndexBuilder *src);
+
+/* Serialize the accumulated genomes to `path` as a `.syldb`. Errors if any
+ * genome is still open (call end_genome), if no genomes were added, or on I/O
+ * failure. Returns 0 on success, non-zero on error. */
 int sylph_index_builder_write(SylphIndexBuilder *builder, const char *path);
 
 /* Free an index builder. Safe to call with NULL. */

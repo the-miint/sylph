@@ -18,6 +18,7 @@
 use crate::builders::{GenomeSketchBuilder, SketchPairBuilder};
 use crate::types::{GenomeSketch, SequencesSketch};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::{c_char, CStr, CString};
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
@@ -438,10 +439,13 @@ pub(crate) unsafe fn sketch_borrow_finalized<'a>(
 // GenomeSketches and bincode-serializes the Vec<GenomeSketch> to a `.syldb`
 // (the same on-disk format sylph_database_load consumes). Lifecycle:
 //
-//   create → { begin_genome → add_contig* → end_genome }* → write → free
+//   create → add_contig(genome_id, order, …)* → end_genome(genome_id) … → merge* → write → free
 //
-// One genome is under construction at a time (the host groups its reference
-// table by a genome-key column and feeds each genome's contigs contiguously).
+// Contigs are addressed by genome id, so the builder keeps one in-progress
+// GenomeSketchBuilder per open genome id and the host may feed different genomes'
+// contigs in any order. `order` records each contig's within-genome position so
+// the lowest-order contig supplies first_contig_name regardless of feed order.
+// merge combines per-thread builders before a single write.
 // ============================================================================
 
 /// Reference-genome sketch parameters. Layout-stable; trailing fields can be
@@ -490,15 +494,25 @@ impl SylphGenomeSketchParams {
     }
 }
 
-/// Accumulates GenomeSketches and serializes them to a `.syldb`. Holds at most
-/// one in-progress genome builder at a time.
+/// Accumulates GenomeSketches and serializes them to a `.syldb`. Holds one
+/// in-progress builder per open genome id (`open`); end_genome finalizes one into
+/// `genomes`.
 pub struct SylphIndexBuilder {
     c: usize,
     k: usize,
     min_spacing: usize,
     pseudotax: bool,
     genomes: Vec<GenomeSketch>,
-    current: Option<GenomeSketchBuilder>,
+    open: HashMap<String, OpenGenome>,
+}
+
+/// One genome under construction. Its contigs may arrive in any order, so the
+/// FASTA-order first contig (lowest `order`) is tracked separately and applied to
+/// the finalized sketch's `first_contig_name`.
+struct OpenGenome {
+    builder: GenomeSketchBuilder,
+    min_order: i64,
+    first_contig_name: String,
 }
 
 /// Populate `out` with the default reference-genome sketch parameters. As with
@@ -544,65 +558,27 @@ pub unsafe extern "C" fn sylph_index_builder_create(
             min_spacing,
             pseudotax: p.pseudotax != 0,
             genomes: Vec::new(),
-            current: None,
+            open: HashMap::new(),
         }))
     })
 }
 
-/// Begin a new reference genome. `file_name` is the genome's identity in the
-/// resulting `.syldb` (the genome-key column value); it may be NULL (→ empty
-/// string). Errors if a previous genome is still open (call end_genome first).
-/// Returns 0 on success, non-zero on error.
+/// Add one contig to the genome identified by `genome_id` (created on first
+/// sight). `genome_id` must be non-NULL — it is the genome's identity in the
+/// `.syldb`. `order` orders contigs within the genome; the lowest-order contig
+/// supplies `first_contig_name` (pass the source contig index / sequence_index).
+/// `contig_name` may be NULL (→ empty). `seq` must be non-NULL (`seq_len` 0
+/// permitted). Contigs of different genomes may be interleaved. Returns 0 on
+/// success, non-zero on error.
 ///
 /// # Safety
-/// `builder` must be a live SylphIndexBuilder. `file_name`, if non-NULL, must
-/// be a NUL-terminated C string.
-#[no_mangle]
-pub unsafe extern "C" fn sylph_index_builder_begin_genome(
-    builder: *mut SylphIndexBuilder,
-    file_name: *const c_char,
-) -> i32 {
-    guarded(-1, || {
-        if builder.is_null() {
-            set_error("sylph_index_builder_begin_genome: builder is NULL");
-            return -1;
-        }
-        let b = &mut *builder;
-        if b.current.is_some() {
-            set_error(
-                "sylph_index_builder_begin_genome: a genome is already open; \
-                 call sylph_index_builder_end_genome first",
-            );
-            return -1;
-        }
-        let name = if file_name.is_null() {
-            String::new()
-        } else {
-            match CStr::from_ptr(file_name).to_str() {
-                Ok(s) => s.to_string(),
-                Err(_) => {
-                    set_error("sylph_index_builder_begin_genome: file_name is not valid UTF-8");
-                    return -1;
-                }
-            }
-        };
-        b.current = Some(GenomeSketchBuilder::new(b.c, b.k, b.min_spacing, b.pseudotax, name));
-        0
-    })
-}
-
-/// Add one contig to the open genome. `contig_name` may be NULL (→ empty); only
-/// the first contig's name is retained as `first_contig_name`. `seq` must be a
-/// non-NULL pointer to `seq_len` bytes (an empty contig — seq_len 0 — is
-/// permitted). Errors if no genome is open. Returns 0 on success, non-zero on
-/// error.
-///
-/// # Safety
-/// `builder` must be a live SylphIndexBuilder with an open genome. `seq` must
-/// point to at least `seq_len` bytes.
+/// `builder` must be a live SylphIndexBuilder. `genome_id`/`contig_name`, if
+/// non-NULL, must be NUL-terminated C strings. `seq` must point to `seq_len` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn sylph_index_builder_add_contig(
     builder: *mut SylphIndexBuilder,
+    genome_id: *const c_char,
+    order: i64,
     contig_name: *const c_char,
     seq: *const u8,
     seq_len: usize,
@@ -612,18 +588,19 @@ pub unsafe extern "C" fn sylph_index_builder_add_contig(
             set_error("sylph_index_builder_add_contig: builder is NULL");
             return -1;
         }
+        if genome_id.is_null() {
+            set_error("sylph_index_builder_add_contig: genome_id is NULL");
+            return -1;
+        }
         if seq.is_null() {
             set_error("sylph_index_builder_add_contig: seq is NULL");
             return -1;
         }
         let b = &mut *builder;
-        let contig = match &mut b.current {
-            Some(g) => g,
-            None => {
-                set_error(
-                    "sylph_index_builder_add_contig: no genome open; call \
-                     sylph_index_builder_begin_genome first",
-                );
+        let gid = match CStr::from_ptr(genome_id).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                set_error("sylph_index_builder_add_contig: genome_id is not valid UTF-8");
                 return -1;
             }
         };
@@ -639,31 +616,64 @@ pub unsafe extern "C" fn sylph_index_builder_add_contig(
             }
         };
         let seq_slice = std::slice::from_raw_parts(seq, seq_len);
-        contig.add_contig(&name, seq_slice);
+        let (c, k, ms, pt) = (b.c, b.k, b.min_spacing, b.pseudotax);
+        let og = b.open.entry(gid.clone()).or_insert_with(|| OpenGenome {
+            builder: GenomeSketchBuilder::new(c, k, ms, pt, gid),
+            min_order: i64::MAX,
+            first_contig_name: String::new(),
+        });
+        og.builder.add_contig(&name, seq_slice);
+        if order <= og.min_order {
+            og.min_order = order;
+            // Match GenomeSketchBuilder's own tab→space normalization.
+            og.first_contig_name = name.replace('\t', " ");
+        }
         0
     })
 }
 
-/// Finalize the open genome into a GenomeSketch and append it to the database.
-/// Errors if no genome is open. Returns 0 on success, non-zero on error.
+/// Finalize the in-progress genome identified by `genome_id` into a GenomeSketch
+/// (applying its lowest-order first_contig_name) and free its markers. Errors if
+/// no open genome has that id. Returns 0 on success, non-zero on error.
 ///
 /// # Safety
-/// `builder` must be a live SylphIndexBuilder with an open genome.
+/// `builder` must be a live SylphIndexBuilder; `genome_id` a NUL-terminated C string.
 #[no_mangle]
-pub unsafe extern "C" fn sylph_index_builder_end_genome(builder: *mut SylphIndexBuilder) -> i32 {
+pub unsafe extern "C" fn sylph_index_builder_end_genome(
+    builder: *mut SylphIndexBuilder,
+    genome_id: *const c_char,
+) -> i32 {
     guarded(-1, || {
         if builder.is_null() {
             set_error("sylph_index_builder_end_genome: builder is NULL");
             return -1;
         }
+        if genome_id.is_null() {
+            set_error("sylph_index_builder_end_genome: genome_id is NULL");
+            return -1;
+        }
         let b = &mut *builder;
-        match b.current.take() {
-            Some(g) => {
-                b.genomes.push(g.finalize());
+        let gid = match CStr::from_ptr(genome_id).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                set_error("sylph_index_builder_end_genome: genome_id is not valid UTF-8");
+                return -1;
+            }
+        };
+        match b.open.remove(&gid) {
+            Some(og) => {
+                let OpenGenome {
+                    builder: gb,
+                    first_contig_name,
+                    ..
+                } = og;
+                let mut gs = gb.finalize();
+                gs.first_contig_name = first_contig_name;
+                b.genomes.push(gs);
                 0
             }
             None => {
-                set_error("sylph_index_builder_end_genome: no genome open");
+                set_error("sylph_index_builder_end_genome: no open genome with that id");
                 -1
             }
         }
@@ -706,7 +716,7 @@ pub unsafe extern "C" fn sylph_index_builder_write(
             return -1;
         }
         let b = &*builder;
-        if b.current.is_some() {
+        if !b.open.is_empty() {
             set_error("sylph_index_builder_write: a genome is still open; call end_genome first");
             return -1;
         }
@@ -738,6 +748,35 @@ pub unsafe extern "C" fn sylph_index_builder_write(
                 -1
             }
         }
+    })
+}
+
+/// Move all completed genomes from `src` into `dst` (`src` ends empty). For
+/// combining per-thread builders before a single write: sketch genomes into K
+/// independent builders across K threads, then merge them into one and write.
+/// Both builders must have no open genome (call end_genome for each first).
+/// Returns 0 on success, non-zero on error.
+///
+/// # Safety
+/// `dst` and `src` must be distinct, live SylphIndexBuilder pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sylph_index_builder_merge(
+    dst: *mut SylphIndexBuilder,
+    src: *mut SylphIndexBuilder,
+) -> i32 {
+    guarded(-1, || {
+        if dst.is_null() || src.is_null() {
+            set_error("sylph_index_builder_merge: dst and src must be non-NULL");
+            return -1;
+        }
+        let d = &mut *dst;
+        let s = &mut *src;
+        if !d.open.is_empty() || !s.open.is_empty() {
+            set_error("sylph_index_builder_merge: a genome is still open; call end_genome first");
+            return -1;
+        }
+        d.genomes.append(&mut s.genomes);
+        0
     })
 }
 
@@ -1283,14 +1322,13 @@ mod tests {
             assert_eq!(sylph_index_builder_num_genomes(b), 0);
 
             let name = CString::new("genome-A").unwrap();
-            assert_eq!(sylph_index_builder_begin_genome(b, name.as_ptr()), 0);
             let contig = CString::new("contig-1").unwrap();
             let seq = synthetic_contig(3000);
             assert_eq!(
-                sylph_index_builder_add_contig(b, contig.as_ptr(), seq.as_ptr(), seq.len()),
+                sylph_index_builder_add_contig(b, name.as_ptr(), 0, contig.as_ptr(), seq.as_ptr(), seq.len()),
                 0
             );
-            assert_eq!(sylph_index_builder_end_genome(b), 0);
+            assert_eq!(sylph_index_builder_end_genome(b, name.as_ptr()), 0);
             assert_eq!(sylph_index_builder_num_genomes(b), 1);
 
             let path = std::env::temp_dir().join("sylph_ffi_index_round_trip.syldb");
@@ -1322,25 +1360,58 @@ mod tests {
     }
 
     #[test]
-    fn index_builder_add_without_begin_errors() {
+    fn index_builder_add_null_genome_id_errors() {
         unsafe {
             let b = sylph_index_builder_create(ptr::null());
             let contig = CString::new("c").unwrap();
             let seq = synthetic_contig(100);
-            let rc = sylph_index_builder_add_contig(b, contig.as_ptr(), seq.as_ptr(), seq.len());
+            let rc =
+                sylph_index_builder_add_contig(b, ptr::null(), 0, contig.as_ptr(), seq.as_ptr(), seq.len());
             assert_eq!(rc, -1);
             sylph_index_builder_free(b);
         }
     }
 
     #[test]
-    fn index_builder_double_begin_errors() {
+    fn index_builder_interleaved_genomes_route_by_id() {
         unsafe {
+            // Contigs for two genomes fed interleaved (A, B, A) must produce
+            // exactly two genomes — the builder keys contigs by genome id.
             let b = sylph_index_builder_create(ptr::null());
-            let name = CString::new("g").unwrap();
-            assert_eq!(sylph_index_builder_begin_genome(b, name.as_ptr()), 0);
-            assert_eq!(sylph_index_builder_begin_genome(b, name.as_ptr()), -1);
+            let a = CString::new("genome-A").unwrap();
+            let bb = CString::new("genome-B").unwrap();
+            let c = CString::new("c").unwrap();
+            let s = synthetic_contig(3000);
+            assert_eq!(sylph_index_builder_add_contig(b, a.as_ptr(), 0, c.as_ptr(), s.as_ptr(), s.len()), 0);
+            assert_eq!(sylph_index_builder_add_contig(b, bb.as_ptr(), 0, c.as_ptr(), s.as_ptr(), s.len()), 0);
+            assert_eq!(sylph_index_builder_add_contig(b, a.as_ptr(), 1, c.as_ptr(), s.as_ptr(), s.len()), 0);
+            assert_eq!(sylph_index_builder_end_genome(b, a.as_ptr()), 0);
+            assert_eq!(sylph_index_builder_end_genome(b, bb.as_ptr()), 0);
+            assert_eq!(sylph_index_builder_num_genomes(b), 2);
+            assert_eq!(sylph_index_builder_end_genome(b, a.as_ptr()), -1, "A already finalized");
             sylph_index_builder_free(b);
+        }
+    }
+
+    #[test]
+    fn index_builder_merge_combines_genomes() {
+        unsafe {
+            // One genome per builder — the per-thread pattern — merged into one.
+            let mk = |name: &str| -> *mut SylphIndexBuilder {
+                let b = sylph_index_builder_create(ptr::null());
+                let n = CString::new(name).unwrap();
+                let s = synthetic_contig(3000);
+                assert_eq!(sylph_index_builder_add_contig(b, n.as_ptr(), 0, n.as_ptr(), s.as_ptr(), s.len()), 0);
+                assert_eq!(sylph_index_builder_end_genome(b, n.as_ptr()), 0);
+                b
+            };
+            let dst = mk("genome-A");
+            let src = mk("genome-B");
+            assert_eq!(sylph_index_builder_merge(dst, src), 0);
+            assert_eq!(sylph_index_builder_num_genomes(dst), 2, "merged count");
+            assert_eq!(sylph_index_builder_num_genomes(src), 0, "src emptied");
+            sylph_index_builder_free(src);
+            sylph_index_builder_free(dst);
         }
     }
 
@@ -1353,9 +1424,14 @@ mod tests {
             let path_c = CString::new(path.to_str().unwrap()).unwrap();
             assert_eq!(sylph_index_builder_write(b, path_c.as_ptr()), -1);
 
-            // Genome still open.
+            // Genome still open (added but not end_genome'd).
             let name = CString::new("g").unwrap();
-            assert_eq!(sylph_index_builder_begin_genome(b, name.as_ptr()), 0);
+            let contig = CString::new("c").unwrap();
+            let seq = synthetic_contig(100);
+            assert_eq!(
+                sylph_index_builder_add_contig(b, name.as_ptr(), 0, contig.as_ptr(), seq.as_ptr(), seq.len()),
+                0
+            );
             assert_eq!(sylph_index_builder_write(b, path_c.as_ptr()), -1);
             sylph_index_builder_free(b);
         }
