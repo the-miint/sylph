@@ -42,7 +42,7 @@ fastrand = "2"
 memory-stats = "1"
 scalable_cuckoo_filter = "0.2"
 serde_yaml = "0.9"
-arrow = { version = "57", default-features = false, features = ["ffi"], optional = true }
+arrow = { version = "59", default-features = false, features = ["ffi"], optional = true }
 
 # Removed: tikv-jemallocator on musl. duckdb-miint's static-lib build links
 # into a host process that already owns the allocator (DuckDB's jemalloc on
