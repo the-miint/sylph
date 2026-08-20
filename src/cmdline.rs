@@ -22,7 +22,7 @@ pub enum Mode {
     ///Inspect sketched .syldb and .sylsp files.
     #[clap(arg_required_else_help = true, display_order = 4)]
     Inspect(InspectArgs),
-    ///Convert a standard database (.syldb) into a two-stage seekable database (.syl2db) for `profile --two-stage`.
+    ///Convert a standard database (.syldb) into a two-stage seekable database (.syl2db), automatically used by `query`/`profile` when given as input.
     #[clap(arg_required_else_help = true, display_order = 5)]
     DbConvert(DbConvertArgs),
 }
@@ -163,18 +163,10 @@ pub struct ContainArgs {
     #[clap(long="log-reassignments", help = "Output information for how k-mers for genomes are reassigned during `profile`. Caution: can be verbose and slows down computation.")]
     pub log_reassignments: bool,
 
-    #[clap(long="two-stage", help_heading = "TWO-STAGE PROFILING", help = "Two-stage profiling (profile only): cheaply SCREEN the sample against the (sparse) database, then densely profile ONLY the genomes that pass the screen. Lets a sparse pre-built database (e.g. -c 200 GTDB) deliver dense -c profiling without ever building/loading a dense full database.")]
-    pub two_stage: bool,
-    #[clap(long="dense-c", default_value_t = DENSE_C_DEFAULT, help_heading = "TWO-STAGE PROFILING", help = "Subsampling rate -c for the dense second stage. Genomes passing the screen are (re)sketched at this rate from their source fasta if the database is sparser than this. The sample sketch must have -c <= this value.")]
-    pub dense_c: usize,
-    #[clap(long="screen-c", help_heading = "TWO-STAGE PROFILING", help = "Subsampling rate -c for the cheap first-stage screen. Default: the database's own -c. Must be >= the database -c (a sketch can only be made sparser, never denser).")]
-    pub screen_c: Option<usize>,
-    #[clap(long="screen-ani", default_value_t = SCREEN_MIN_ANI_DEFAULT, help_heading = "TWO-STAGE PROFILING", help = "Minimum adjusted ANI (0-100) for a genome to pass the first-stage screen. Deliberately permissive; the dense stage recovers specificity.")]
+    #[clap(long="screen-ani", default_value_t = SCREEN_MIN_ANI_DEFAULT, help_heading = "TWO-STAGE PROFILING", help = "Two-stage databases (.syl2db) only: minimum adjusted ANI (0-100) for a genome to pass the first-stage screen. Deliberately permissive; the dense stage recovers specificity.")]
     pub screen_ani: f64,
-    #[clap(long="screen-min-matches", default_value_t = 1, help_heading = "TWO-STAGE PROFILING", help = "Minimum number of matched stage-1 screen k-mers for a genome to pass the screen and be densely decoded. Default 1 keeps the same results as single-stage; raising it (e.g. with a permissive --screen-ani) cheaply prunes genomes that pass on a handful of chance-shared k-mers, cutting wasted dense decodes at a small sensitivity cost for very-low-coverage genomes.")]
+    #[clap(long="screen-min-matches", default_value_t = 1, help_heading = "TWO-STAGE PROFILING", help = "Two-stage databases (.syl2db) only: minimum number of matched stage-1 screen k-mers for a genome to pass the screen and be densely decoded. Default 1 keeps the same results as single-stage; raising it (e.g. with a permissive --screen-ani) cheaply prunes genomes that pass on a handful of chance-shared k-mers, cutting wasted dense decodes at a small sensitivity cost for very-low-coverage genomes.")]
     pub screen_min_matches: usize,
-    #[clap(long="dense-cache", help_heading = "TWO-STAGE PROFILING", help = "Directory of cached per-genome dense sketches (*.sylgn). Genomes (re)sketched for the dense stage are stored here and reused across samples/runs, so a dense database is grown lazily only for genomes that actually appear.")]
-    pub dense_cache: Option<String>,
     #[clap(long="screen-dump", hidden=true, help_heading = "TWO-STAGE PROFILING", help = "Debug: write a TSV of every stage-1 screen survivor (genome, matched/total screen k-mers, naive/adjusted ANI, median coverage) to this file.")]
     pub screen_dump: Option<String>,
 

@@ -7,7 +7,7 @@ use fxhash::FxHashMap;
 use crate::constants::*;
 use crate::inference::*;
 use crate::sketch::*;
-use crate::twostage_db::{ScreenIndex, TwoStageDb};
+use crate::twostage_db::TwoStageDb;
 use crate::types::*;
 use log::*;
 use rayon::prelude::*;
@@ -113,152 +113,41 @@ fn get_chunks(indices: &Vec<usize>, steps: usize) -> Vec<Vec<usize>>{
     return_chunks
 }
 
-/// FracMinHash keeps a hashed k-mer iff `hash < u64::MAX / c`. Because the
-/// threshold shrinks as `c` grows, the set of k-mers kept at a large `c` (sparse)
-/// is a strict subset of the set kept at a small `c` (dense). So we can turn an
-/// already-loaded sketch into a *sparser* one for free by dropping every k-mer
-/// whose hash is above the coarser threshold. We can NOT go the other way --
-/// making a sketch denser requires re-reading the source sequence.
-fn subsample_view(gs: &GenomeSketch, target_c: usize) -> GenomeSketch {
-    let mut out = gs.clone();
-    if target_c <= gs.c {
-        // Already at (or denser than) the requested rate; nothing to drop.
-        return out;
-    }
-    let thresh = u64::MAX / (target_c as u64);
-    out.c = target_c;
-    out.genome_kmers = gs.genome_kmers.iter().copied().filter(|h| *h < thresh).collect();
-    if let Some(p) = &gs.pseudotax_tracked_nonused_kmers {
-        out.pseudotax_tracked_nonused_kmers =
-            Some(p.iter().copied().filter(|h| *h < thresh).collect());
-    }
-    out
-}
-
-/// Path of the per-genome dense-sketch cache file for a given source fasta.
-fn dense_cache_path(dir: &str, file_name: &str, dense_c: usize, k: usize) -> String {
-    let h = fxhash::hash64(&file_name);
-    format!("{}/{:016x}.c{}.k{}{}", dir, h, dense_c, k, GENOME_SKETCH_SUFFIX)
-}
-
-/// Obtain a *dense* (`-c = dense_c`) sketch for a genome that passed the screen.
-///   * database already as dense / denser -> reuse (subsampling if denser),
-///   * database sparser -> (re)sketch the source fasta at `dense_c`,
-///     reusing an on-disk cache and an in-memory cache so each fasta is only
-///     ever sketched once. This is how a dense database is grown lazily, only
-///     for the genomes that actually appear in samples.
-fn densify_genome(
-    db_sketch: &GenomeSketch,
-    dense_c: usize,
-    k: usize,
-    min_spacing: usize,
-    mem_cache: &Mutex<FxHashMap<String, GenomeSketch>>,
-    disk_cache: &Option<String>,
-) -> Option<GenomeSketch> {
-    if db_sketch.c <= dense_c {
-        return Some(subsample_view(db_sketch, dense_c));
-    }
-
-    let key = db_sketch.file_name.clone();
-    if let Some(hit) = mem_cache.lock().unwrap().get(&key) {
-        return Some(hit.clone());
-    }
-
-    if let Some(dir) = disk_cache {
-        let path = dense_cache_path(dir, &key, dense_c, k);
-        if Path::new(&path).exists() {
-            if let Ok(file) = File::open(&path) {
-                let reader = BufReader::with_capacity(10_000_000, file);
-                if let Ok(gs) = bincode::deserialize_from::<_, GenomeSketch>(reader) {
-                    mem_cache.lock().unwrap().insert(key, gs.clone());
-                    return Some(gs);
-                }
-            }
-        }
-    }
-
-    let sketched = sketch_genome(dense_c, k, &key, min_spacing, true)?;
-
-    if let Some(dir) = disk_cache {
-        let path = dense_cache_path(dir, &key, dense_c, k);
-        match File::create(&path) {
-            Ok(file) => {
-                let mut writer = BufWriter::new(file);
-                if let Err(e) = bincode::serialize_into(&mut writer, &sketched) {
-                    warn!("Could not write dense-sketch cache {}: {}", path, e);
-                }
-            }
-            Err(e) => warn!("Could not create dense-sketch cache {}: {}", path, e),
-        }
-    }
-
-    mem_cache.lock().unwrap().insert(key, sketched.clone());
-    Some(sketched)
-}
-
-/// Two-stage stage 1 + 2: screen `sequence_sketch` against the pooled
-/// `screen_index` (a single inverted pass over the sample at the sparse
-/// `screen_c`), then return *dense* (`dense_c`) sketches for only the genomes
-/// that pass. `plain_genome_sketches` is `Some` only for the non-`.syl2db`
-/// (densify) path; a `.syl2db` decodes survivors by index instead. The returned
-/// set replaces the full database for the (expensive) dense profiling that follows.
+/// Two-stage stage 1 + 2 against one `.syl2db`: screen `sequence_sketch`
+/// against the database's pooled `screen_index` (a single inverted pass over
+/// the sample at the sparse, per-database `screen_c`), then decode and return
+/// *dense* sketches for only the genomes that pass. The returned set is one
+/// database's contribution to the combined active-genome list the (expensive)
+/// dense profiling pass runs against.
 fn compute_dense_survivors(
     args: &ContainArgs,
-    screen_index: &ScreenIndex,
-    plain_genome_sketches: Option<&Vec<GenomeSketch>>,
+    db: &TwoStageDb,
     sequence_sketch: &SequencesSketch,
-    screen_c: usize,
-    dense_c: usize,
-    k: usize,
-    min_spacing: usize,
-    mem_cache: &Mutex<FxHashMap<String, GenomeSketch>>,
-    disk_cache: &Option<String>,
-    two_stage_db: Option<&TwoStageDb>,
 ) -> Vec<GenomeSketch> {
+    let screen_index = &db.screen_index;
     // Stage 1: cheap, permissive screen (query-like settings, no CIs).
     let mut screen_args = args.clone();
     screen_args.pseudotax = false;
     screen_args.minimum_ani = Some(args.screen_ani);
     screen_args.no_ci = true;
-    // The screen scores against sketches sub-sampled to `screen_c`, so the dense
-    // `-M/--min-number-kmers` floor would over-reject here: a genome/contig has
+    // The screen scores against sketches sub-sampled to `db.screen_c`, so the
+    // dense `-M/--min-number-kmers` floor would over-reject here: a genome has
     // only ~length/screen_c sparse k-mers, so the dense floor M corresponds to a
-    // length of M*screen_c (e.g. 50*3000 = 150 kb), silently dropping smaller
-    // genomes (viruses, plasmids, short contigs) that single-stage profiling
-    // would report. Scale the floor to the screen resolution so a genome that
-    // could clear the dense floor also clears the screen; genomes truly below the
-    // floor are still rejected at the dense stage.
-    screen_args.min_number_kmers = args.min_number_kmers * dense_c as f64 / screen_c as f64;
-
-    // The densify fallback (no .syl2db) re-sketches whole FASTA files keyed by
-    // file name, which collapses `--individual-records` databases (many records
-    // share a file name) into a single whole-file sketch. Reject that up front;
-    // `db-convert` to a .syl2db preserves individual records and works fine.
-    if let Some(genome_sketches) = plain_genome_sketches {
-        let mut seen = std::collections::HashSet::with_capacity(genome_sketches.len());
-        for gs in genome_sketches.iter() {
-            if !seen.insert(gs.file_name.as_str()) {
-                log::error!(
-                    "--two-stage on a raw --individual-records database is unsupported \
-                     (densification re-sketches whole files). Convert it with `sylph db-convert` \
-                     first (a .syl2db preserves individual records). Exiting."
-                );
-                std::process::exit(1);
-            }
-        }
-    }
+    // length of M*screen_c, silently dropping smaller genomes (viruses,
+    // plasmids, short contigs) that single-stage profiling would report. Scale
+    // the floor to the screen resolution so a genome that could clear the dense
+    // floor also clears the screen; genomes truly below the floor are still
+    // rejected at the dense stage. `db.screen_c` is the *stored* (possibly
+    // adaptively-densified, see `write_two_stage_db`) rate, so this scaling
+    // automatically becomes less aggressive too when a small genome forced a
+    // denser effective rate.
+    screen_args.min_number_kmers = args.min_number_kmers * db.c as f64 / db.screen_c as f64;
 
     // Stage 1 = "Path B": one inverted pass over the sample produces, per genome,
     // the same matched-coverage multiset the per-genome `get_stats` loop would
     // collect; feeding it to the same `finalize_stats` + `--screen-min-matches` +
     // `min_number_kmers` checks reproduces the survivor set exactly, in O(sample)
     // rather than O(reference) work. (See experiments/7_mphf_screen_again.)
-    let name_of = |g: usize| -> String {
-        match two_stage_db {
-            Some(db) => db.genome_file_name(g as u32).to_string(),
-            None => plain_genome_sketches.unwrap()[g].file_name.clone(),
-        }
-    };
     let hits: Vec<(u32, Vec<u32>)> = screen_index
         .gather_hits(sequence_sketch)
         .into_iter()
@@ -277,7 +166,7 @@ fn compute_dense_survivors(
             }
             let contain_count = covs.len();
             // finalize_stats applies the screen min-ANI gate (returns None below it).
-            let fin = finalize_stats(&screen_args, k, n_kmers, contain_count, covs, None)?;
+            let fin = finalize_stats(&screen_args, db.k, n_kmers, contain_count, covs, None)?;
             // Require at least `--screen-min-matches` matched screen k-mers; this
             // cheaply drops genomes that clear the (permissive) screen ANI on only
             // a few chance-shared k-mers, before they cost a dense decode. Default
@@ -287,7 +176,7 @@ fn compute_dense_survivors(
             }
             if args.screen_dump.is_some() {
                 dump.lock().unwrap().push((
-                    name_of(g),
+                    db.genome_file_name(g as u32).to_string(),
                     contain_count,
                     n_kmers,
                     fin.naive_ani * 100.,
@@ -301,7 +190,7 @@ fn compute_dense_survivors(
     survivors.sort_unstable();
     log::info!(
         "{}: stage-1 screen (c={}, min-ANI {}) kept {} / {} candidate genomes",
-        sequence_sketch.file_name, screen_c, args.screen_ani, survivors.len(), screen_index.num_genomes()
+        sequence_sketch.file_name, db.screen_c, args.screen_ani, survivors.len(), screen_index.num_genomes()
     );
     if let Some(path) = &args.screen_dump {
         let mut f = BufWriter::new(File::create(path).expect("could not create --screen-dump file"));
@@ -312,38 +201,27 @@ fn compute_dense_survivors(
         log::info!("Wrote stage-1 screen dump to {}", path);
     }
 
-    // Stage 2. With a .syl2db we decode each survivor's dense block into a
-    // short-lived sketch, run the (prefetch-friendly) pass-1 profiling on it, and
-    // keep it only if it passes -- so the discarded majority is freed immediately
-    // and never cached, keeping peak RAM proportional to the genomes that survive
-    // rather than to the (much larger) screen-survivor set. With a plain database
-    // the dense sketch is derived/re-sketched by densify_genome and filtered the
-    // same way.
+    // Stage 2: decode each survivor's dense block into a short-lived sketch,
+    // run the (prefetch-friendly) pass-1 profiling on it, and keep it only if
+    // it passes -- so the discarded majority is freed immediately and never
+    // cached, keeping peak RAM proportional to the genomes that survive rather
+    // than to the (much larger) screen-survivor set.
     let dense: Mutex<Vec<GenomeSketch>> = Mutex::new(vec![]);
     survivors.par_iter().for_each(|i| {
-        let g = match two_stage_db {
-            Some(db) => match db.decode_dense(*i as u32) {
-                Ok(g) => Some(g),
-                Err(e) => {
-                    warn!("Could not decode dense block for genome index {}: {}", i, e);
-                    None
+        match db.decode_dense(*i as u32) {
+            Ok(g) => {
+                // Keep only genomes that pass pass-1 profiling; drop (free) the rest.
+                if get_stats(args, &g, sequence_sketch, None, false).is_some() {
+                    dense.lock().unwrap().push(g);
                 }
-            },
-            None => {
-                densify_genome(&plain_genome_sketches.unwrap()[*i], dense_c, k, min_spacing, mem_cache, disk_cache)
             }
-        };
-        if let Some(g) = g {
-            // Keep only genomes that pass pass-1 profiling; drop (free) the rest.
-            if get_stats(args, &g, sequence_sketch, None, false).is_some() {
-                dense.lock().unwrap().push(g);
-            }
+            Err(e) => warn!("Could not decode dense block for genome index {}: {}", i, e),
         }
     });
     let dense = dense.into_inner().unwrap();
     log::info!(
         "{}: stage-2 dense profiling (c={}) against {} genomes",
-        sequence_sketch.file_name, dense_c, dense.len()
+        sequence_sketch.file_name, db.c, dense.len()
     );
     dense
 }
@@ -466,116 +344,89 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
         std::process::exit(1);
     }
 
-    // A .syl2db is a self-contained two-stage database: open it (loading only the
-    // sparse stage-1 index) and use its per-genome sparse sketches as the screen.
-    let two_stage_db: Option<TwoStageDb> = if !two_stage_db_files.is_empty() {
-        if two_stage_db_files.len() > 1 || !genome_sketch_files.is_empty() || !genome_files.is_empty() {
-            log::error!("A two-stage database ({}) must be the only genome input. Exiting", TWO_STAGE_DB_SUFFIX);
+    // Any number of .syl2db files can be combined with each other and with
+    // plain .syldb/fasta genomes in one call: each .syl2db is screened and
+    // decoded independently per sample (see the per-sample loop below), and
+    // its survivors are unioned with the (always fully-loaded, unscreened)
+    // plain genomes before profiling/reassignment.
+    let two_stage_dbs: Vec<TwoStageDb> = two_stage_db_files.iter().map(|f| {
+        log::info!("Opening two-stage database {} (loading stage-1 sparse index)...", f);
+        crate::twostage_db::open_file(f)
+            .unwrap_or_else(|e| panic!("{} is not a valid two-stage database: {}", f, e))
+    }).collect();
+    for db in &two_stage_dbs {
+        if db.is_empty() {
+            log::error!("Two-stage database contains no genomes. Exiting");
             std::process::exit(1);
         }
-        if !args.pseudotax {
-            log::error!("Two-stage databases ({}) are only supported for `sylph profile`, not `sylph query`. Exiting", TWO_STAGE_DB_SUFFIX);
-            std::process::exit(1);
-        }
-        log::info!("Opening two-stage database {} (loading stage-1 sparse index)...", two_stage_db_files[0]);
-        let db = crate::twostage_db::open_file(two_stage_db_files[0])
-            .unwrap_or_else(|e| panic!("{} is not a valid two-stage database: {}", two_stage_db_files[0], e));
-        // The database is inherently two-stage; enable the screen-then-densify path.
-        args.two_stage = true;
-        Some(db)
-    } else {
-        None
-    };
+    }
 
-    // A .syl2db screens via its pooled stage-1 index and decodes dense blocks by
-    // index for stage 2, so it carries no in-memory `GenomeSketch` list. Only the
-    // plain-database path materializes one here.
-    let genome_sketches = match &two_stage_db {
-        Some(_) => Vec::new(),
-        None => get_genome_sketches(&args, &genome_sketch_files, &genome_files),
-    };
+    let genome_sketches = get_genome_sketches(&args, &genome_sketch_files, &genome_files);
     log::info!("Finished obtaining genome sketches.");
 
-    match &two_stage_db {
-        Some(db) => {
-            if db.is_empty() {
-                log::error!("Two-stage database contains no genomes. Exiting");
-                std::process::exit(1);
-            }
-        }
-        None => {
-            if genome_sketches.is_empty() {
-                log::error!("No genome sketches found; see sylph query/profile -h for help. Exiting");
-                std::process::exit(1);
-            }
-            if genome_sketches.first().unwrap().pseudotax_tracked_nonused_kmers.is_none() && args.pseudotax{
-                log::error!("Attempting profiling, but *.syldb was sketched with the --disable-profiling option. Exiting");
-                std::process::exit(1);
-            }
-        }
+    if two_stage_dbs.is_empty() && genome_sketches.is_empty() {
+        log::error!("No genome sketches found; see sylph query/profile -h for help. Exiting");
+        std::process::exit(1);
     }
+    if !genome_sketches.is_empty()
+        && genome_sketches.first().unwrap().pseudotax_tracked_nonused_kmers.is_none() && args.pseudotax {
+        log::error!("Attempting profiling, but *.syldb was sketched with the --disable-profiling option. Exiting");
+        std::process::exit(1);
+    }
+    // (No equivalent pseudotax-completeness check is needed for two_stage_dbs:
+    // db-convert already requires 100% pseudotax coverage at conversion time.)
 
-    // ---- Two-stage profiling setup ----------------------------------------
-    // A .syl2db dictates its own dense rate (`c`) and stage-1 screen rate
-    // (`screen_c`); otherwise they come from the database `-c` and the flags.
-    let (db_c, db_k, screen_c, dense_c) = match &two_stage_db {
-        Some(db) => (db.c, db.k, db.screen_c, db.c),
-        None => {
-            let db_c = genome_sketches[0].c;
-            (
-                db_c,
-                genome_sketches[0].k,
-                args.screen_c.unwrap_or(SCREEN_C_DEFAULT).max(db_c),
-                args.dense_c,
-            )
-        }
-    };
-    let dense_mem_cache: Mutex<FxHashMap<String, GenomeSketch>> = Mutex::new(FxHashMap::default());
-    if args.two_stage {
-        if !args.pseudotax {
-            log::error!("--two-stage is only supported for `sylph profile`, not `sylph query`. Exiting");
-            std::process::exit(1);
-        }
-        if dense_c > screen_c {
-            log::error!("--dense-c ({}) must be <= the screen -c ({}); the dense stage cannot be sparser than the screen. Exiting", dense_c, screen_c);
-            std::process::exit(1);
-        }
-        if let Some(dir) = &args.dense_cache {
-            if let Err(e) = std::fs::create_dir_all(dir) {
-                log::error!("Could not create --dense-cache directory {}: {}. Exiting", dir, e);
-                std::process::exit(1);
+    // Duplicate genomes loaded across multiple sources (e.g. the same genome
+    // present in both a .syl2db and a plain .syldb) collide as identical
+    // GenomeSketch entries downstream in reassignment/dereplication, causing
+    // nondeterministic output (whichever copy a racing thread inserts first
+    // "wins"). Warn loudly rather than silently producing inconsistent runs.
+    {
+        let mut seen: FxHashMap<(&str, &str), usize> = FxHashMap::default();
+        for db in &two_stage_dbs {
+            for g in 0..db.len() {
+                *seen.entry((db.genome_file_name(g as u32), db.genome_first_contig_name(g as u32))).or_insert(0) += 1;
             }
         }
-        if two_stage_db.is_some() {
-            log::info!(
-                "Two-stage database profiling: screen at c={} (min-ANI {}), dense profile at c={} by decoding only the screened genomes' compressed blocks.",
-                screen_c, args.screen_ani, dense_c
-            );
-        } else {
-            log::info!(
-                "Two-stage profiling enabled: screen at c={} (min-ANI {}), dense profile at c={}{}.",
-                screen_c, args.screen_ani, dense_c,
-                if db_c > dense_c { " by (re)sketching candidate genomes from their source fasta" } else { "" }
+        for gs in &genome_sketches {
+            *seen.entry((gs.file_name.as_str(), gs.first_contig_name.as_str())).or_insert(0) += 1;
+        }
+        let dups: Vec<&(&str, &str)> = seen.iter().filter(|(_, &n)| n > 1).map(|(k, _)| k).collect();
+        if !dups.is_empty() {
+            log::warn!(
+                "{} genome(s) appear more than once across the combined input sources \
+                 (same file name + contig name loaded from two different databases): {:?}. \
+                 This can cause nondeterministic reassignment/dereplication output -- consider \
+                 removing the duplicate(s) from one of the input databases.",
+                dups.len(), dups
             );
         }
     }
-    // The sample sketch must not be sparser than the genome rate it is compared
-    // against: the full DB rate normally, or the dense rate under two-stage.
-    let effective_genome_c = if args.two_stage { dense_c } else { db_c };
 
-    // Stage-1 screen index. A .syl2db carries its own (loaded from file); the
-    // plain-database two-stage path builds one in memory once, from each genome
-    // subsampled to `screen_c`.
-    let inmem_screen_index: Option<ScreenIndex> = if args.two_stage && two_stage_db.is_none() {
-        log::info!("Building in-memory stage-1 screen index (c={}).", screen_c);
-        let sparse_per_genome: Vec<Vec<u64>> = genome_sketches
-            .par_iter()
-            .map(|gs| subsample_view(gs, screen_c).genome_kmers)
-            .collect();
-        Some(ScreenIndex::build(&sparse_per_genome, screen_c, db_k))
-    } else {
-        None
-    };
+    // k must match exactly across every loaded source.
+    let mut ks: Vec<usize> = two_stage_dbs.iter().map(|db| db.k).collect();
+    if !genome_sketches.is_empty() { ks.push(genome_sketches[0].k); }
+    ks.dedup();
+    if ks.len() > 1 {
+        log::error!("Inconsistent -k across combined genome sources ({:?}). Exiting", ks);
+        std::process::exit(1);
+    }
+    let db_k = ks[0];
+
+    // The sample sketch must not be sparser than any active genome's own rate
+    // (get_stats hard-exits otherwise): use the minimum -c across every loaded
+    // source (two-stage dense rate and plain -c alike).
+    let effective_genome_c = two_stage_dbs.iter().map(|db| db.c)
+        .chain(genome_sketches.iter().map(|g| g.c))
+        .min()
+        .expect("at least one genome source must be present (checked above)");
+
+    log::info!(
+        "Loaded {} two-stage database(s) ({} genomes total) and {} plain genome sketch(es).",
+        two_stage_dbs.len(),
+        two_stage_dbs.iter().map(|d| d.len()).sum::<usize>(),
+        genome_sketches.len(),
+    );
 
     let num_raw_read_files = read_files.len();
     let step;
@@ -621,34 +472,21 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
                     log::debug!("{} has estimated identity {:.3}.", &first_read_file, kmer_id_opt.unwrap().powf(1./sequence_sketch.k as f64) * 100.);
                 }
 
-                // Under two-stage, screen first and replace the full database
-                // with dense sketches of only the genomes that pass.
-                let dense_local: Vec<GenomeSketch>;
-                let active_sketches: &Vec<GenomeSketch> = if args.two_stage {
-                    let screen_index = match &two_stage_db {
-                        Some(db) => &db.screen_index,
-                        None => inmem_screen_index.as_ref().unwrap(),
-                    };
-                    let plain_genome_sketches = two_stage_db.is_none().then_some(&genome_sketches);
-                    dense_local = compute_dense_survivors(
-                        &args, screen_index, plain_genome_sketches, &sequence_sketch, screen_c, dense_c,
-                        db_k, args.min_spacing_kmer, &dense_mem_cache, &args.dense_cache,
-                        two_stage_db.as_ref(),
-                    );
-                    &dense_local
-                } else {
-                    &genome_sketches
-                };
-                let active_index_vec = (0..active_sketches.len()).collect::<Vec<usize>>();
+                // Screen each two-stage database, then union its survivors with
+                // the (always fully-loaded, unscreened) plain genomes into one
+                // combined active-genome list for this sample.
+                let mut dense_local: Vec<GenomeSketch> = Vec::new();
+                for db in &two_stage_dbs {
+                    dense_local.extend(compute_dense_survivors(&args, db, &sequence_sketch));
+                }
+                let active_sketches: Vec<&GenomeSketch> =
+                    dense_local.iter().chain(genome_sketches.iter()).collect();
 
                 let stats_vec_seq: Mutex<Vec<AniResult>> = Mutex::new(vec![]);
-                active_index_vec.par_iter().for_each(|i| {
-                    let genome_sketch = &active_sketches[*i];
-                    let res = get_stats(&args, &genome_sketch, &sequence_sketch, None, args.log_reassignments);
-                    if res.is_some() {
-                        //res.as_mut().unwrap().genome_sketch_index = *i;
-                        stats_vec_seq.lock().unwrap().push(res.unwrap());
-                        
+                active_sketches.par_iter().for_each(|genome_sketch| {
+                    let res = get_stats(&args, genome_sketch, &sequence_sketch, None, args.log_reassignments);
+                    if let Some(res) = res {
+                        stats_vec_seq.lock().unwrap().push(res);
                     }
                 });
 

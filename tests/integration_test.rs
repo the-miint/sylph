@@ -598,75 +598,6 @@ fn test_inspect(){
 
 #[serial]
 #[test]
-fn test_two_stage_profile(){
-    fresh();
-    let dir = "./tests/results/two_stage";
-    let _ = fs::remove_dir_all(dir);
-
-    // Sparse (-c 200) database that retains the source fasta paths.
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
-    cmd.arg("sketch").arg("-c").arg("200")
-        .arg("./test_files/e.coli-EC590.fasta.gz")
-        .arg("./test_files/e.coli-o157.fasta.gz")
-        .arg("./test_files/e.coli-K12.fasta.gz")
-        .arg("-o").arg(format!("{}/db_c200", dir))
-        .assert().success().code(0);
-
-    // Dense (-c 50) read sample.
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
-    cmd.arg("sketch").arg("-c").arg("50")
-        .arg("./test_files/o157_reads.fastq.gz")
-        .arg("-d").arg(dir)
-        .assert().success().code(0);
-
-    let db = format!("{}/db_c200.syldb", dir);
-    let sample = format!("{}/o157_reads.fastq.gz.sylsp", dir);
-    let cache = format!("{}/cache", dir);
-
-    // Two-stage profile: screen at c=200, densely profile the survivors at c=50
-    // by re-sketching their source fastas, caching the dense sketches.
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
-    let output = cmd.arg("profile").arg("--two-stage")
-        .arg("--dense-c").arg("50")
-        .arg("--dense-cache").arg(&cache)
-        .arg(&db).arg(&sample)
-        .output().expect("Output failed");
-    assert!(output.status.success());
-    let two_stage = str::from_utf8(&output.stdout).expect("not UTF-8").to_string();
-    // The reads are E. coli O157 -> that genome must be profiled.
-    assert!(two_stage.contains("e.coli-o157.fasta.gz"));
-    // The dense stage caches a per-genome sketch for each screened survivor.
-    assert!(Path::new(&cache).exists());
-    assert!(fs::read_dir(&cache).unwrap().count() >= 1, "dense cache was not populated");
-
-    // Genomes detected by two-stage must equal those of a plain single-stage
-    // profile of the same dense reads against a dense (-c 50) database.
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
-    cmd.arg("sketch").arg("-c").arg("50")
-        .arg("./test_files/e.coli-EC590.fasta.gz")
-        .arg("./test_files/e.coli-o157.fasta.gz")
-        .arg("./test_files/e.coli-K12.fasta.gz")
-        .arg("-o").arg(format!("{}/db_c50", dir))
-        .assert().success().code(0);
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
-    let output = cmd.arg("profile")
-        .arg(format!("{}/db_c50.syldb", dir)).arg(&sample)
-        .output().expect("Output failed");
-    let single = str::from_utf8(&output.stdout).expect("not UTF-8").to_string();
-
-    let detected = |tsv: &str| -> Vec<String> {
-        let mut v: Vec<String> = tsv.lines().skip(1)
-            .filter_map(|l| l.split('\t').nth(1).map(|s| s.to_string()))
-            .collect();
-        v.sort();
-        v
-    };
-    assert_eq!(detected(&two_stage), detected(&single),
-        "two-stage and single-stage detected different genome sets");
-}
-
-#[serial]
-#[test]
 fn test_two_stage_db_convert_and_profile(){
     fresh();
     let dir = "./tests/results/two_stage_db";
@@ -708,10 +639,11 @@ fn test_two_stage_db_convert_and_profile(){
     let two_sz = fs::metadata(&two_stage_db).unwrap().len();
     assert!(two_sz < dense_sz, "compressed two-stage db ({} B) not smaller than dense db ({} B)", two_sz, dense_sz);
 
-    // Profile --two-stage directly against the .syl2db: stage 1 screens via the
-    // sparse index, stage 2 decodes only the screened genomes' dense blocks.
+    // Profile against the .syl2db directly -- two-stage is auto-detected from
+    // the file extension, no flag needed: stage 1 screens via the sparse
+    // index, stage 2 decodes only the screened genomes' dense blocks.
     let mut cmd = Command::cargo_bin("sylph").unwrap();
-    let output = cmd.arg("profile").arg("--two-stage")
+    let output = cmd.arg("profile")
         .arg(&two_stage_db).arg(&sample)
         .output().expect("Output failed");
     assert!(output.status.success());
@@ -735,9 +667,13 @@ fn test_two_stage_db_convert_and_profile(){
     assert_eq!(detected(&from_db2), detected(&single),
         "two-stage .syl2db and single-stage detected different genome sets");
 
-    // `query` must refuse a .syl2db (it is profile-only).
+    // `query` (containment-only, no reassignment) also auto-detects a .syl2db.
     let mut cmd = Command::cargo_bin("sylph").unwrap();
-    cmd.arg("query").arg(&two_stage_db).arg(&sample).assert().failure();
+    let output = cmd.arg("query").arg(&two_stage_db).arg(&sample)
+        .output().expect("Output failed");
+    assert!(output.status.success(), "query against a .syl2db should succeed");
+    let query_out = str::from_utf8(&output.stdout).expect("not UTF-8").to_string();
+    assert!(query_out.contains("e.coli-o157.fasta.gz"));
 }
 
 #[serial]
@@ -791,7 +727,7 @@ fn test_two_stage_individual_records(){
     };
 
     let mut cmd = Command::cargo_bin("sylph").unwrap();
-    let two = cmd.arg("profile").arg("--two-stage").arg(&two_stage_db).arg(&sample)
+    let two = cmd.arg("profile").arg(&two_stage_db).arg(&sample)
         .output().expect("Output failed");
     assert!(two.status.success());
     let two = str::from_utf8(&two.stdout).expect("not UTF-8").to_string();
@@ -802,15 +738,174 @@ fn test_two_stage_individual_records(){
         .output().expect("Output failed");
     let single = str::from_utf8(&single.stdout).expect("not UTF-8").to_string();
 
-    // db-convert + two-stage must reproduce single-stage per-record detections
-    // (no collapsing/merging of records sharing a file name).
+    // db-convert + auto-detected two-stage must reproduce single-stage
+    // per-record detections (no collapsing/merging of records sharing a file
+    // name).
     assert_eq!(detected(&two), detected(&single),
         "two-stage .syl2db lost or merged individual records vs single-stage");
+}
 
-    // The densify fallback (raw .syldb --two-stage, no db-convert) cannot handle
-    // individual records and must error rather than silently corrupt them.
+/// Combining a `.syl2db` and a plain `.syldb` in one `profile` call must union
+/// their genomes (screen survivors from the two-stage db + all genomes from the
+/// plain db) and detect the same genomes as a single dense database containing
+/// everything.
+#[serial]
+#[test]
+fn test_two_stage_mixed_sources(){
+    fresh();
+    let dir = "./tests/results/two_stage_mixed";
+    let _ = fs::remove_dir_all(dir);
+    fs::create_dir_all(dir).unwrap();
+
+    // o157 goes into a two-stage db; K12 and EC590 stay as a plain dense db.
     let mut cmd = Command::cargo_bin("sylph").unwrap();
-    cmd.arg("profile").arg("--two-stage").arg("--dense-c").arg("50")
-        .arg(&dense_db).arg(&sample)
-        .assert().failure();
+    cmd.arg("sketch").arg("-c").arg("50")
+        .arg("./test_files/e.coli-o157.fasta.gz")
+        .arg("-o").arg(format!("{}/db_o157", dir))
+        .assert().success().code(0);
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("sketch").arg("-c").arg("50")
+        .arg("./test_files/e.coli-K12.fasta.gz")
+        .arg("./test_files/e.coli-EC590.fasta.gz")
+        .arg("-o").arg(format!("{}/db_plain", dir))
+        .assert().success().code(0);
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("sketch").arg("-c").arg("50")
+        .arg("./test_files/o157_reads.fastq.gz")
+        .arg("-d").arg(dir)
+        .assert().success().code(0);
+
+    let sample = format!("{}/o157_reads.fastq.gz.sylsp", dir);
+
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("db-convert").arg(format!("{}/db_o157.syldb", dir))
+        .arg("--screen-c").arg("200")
+        .arg("-o").arg(format!("{}/db_o157_2", dir))
+        .assert().success().code(0);
+    let two_stage_db = format!("{}/db_o157_2.syl2db", dir);
+    let plain_db = format!("{}/db_plain.syldb", dir);
+
+    // Mixed: one .syl2db + one plain .syldb in the same profile call.
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mixed = cmd.arg("profile").arg(&two_stage_db).arg(&plain_db).arg(&sample)
+        .output().expect("Output failed");
+    assert!(mixed.status.success());
+    let mixed = str::from_utf8(&mixed.stdout).expect("not UTF-8").to_string();
+
+    // Reference: a single dense .syldb containing all three genomes together.
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("sketch").arg("-c").arg("50")
+        .arg("./test_files/e.coli-o157.fasta.gz")
+        .arg("./test_files/e.coli-K12.fasta.gz")
+        .arg("./test_files/e.coli-EC590.fasta.gz")
+        .arg("-o").arg(format!("{}/db_all", dir))
+        .assert().success().code(0);
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let single = cmd.arg("profile").arg(format!("{}/db_all.syldb", dir)).arg(&sample)
+        .output().expect("Output failed");
+    let single = str::from_utf8(&single.stdout).expect("not UTF-8").to_string();
+
+    let detected = |tsv: &str| -> Vec<String> {
+        let mut v: Vec<String> = tsv.lines().skip(1)
+            .filter_map(|l| l.split('\t').nth(1).map(|s| s.to_string()))
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(detected(&mixed), detected(&single),
+        "mixed .syl2db + .syldb profile detected a different genome set than a combined single-stage database");
+}
+
+/// A genome with very few total dense k-mers (a short contig/virus) must
+/// trigger the db-convert warning, and the resulting .syl2db must still be
+/// valid and profile the other (normal-sized) genomes correctly.
+#[serial]
+#[test]
+fn test_two_stage_small_genome_warning(){
+    fresh();
+    let dir = "./tests/results/two_stage_small_genome";
+    let _ = fs::remove_dir_all(dir);
+    fs::create_dir_all(dir).unwrap();
+
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("sketch").arg("-c").arg("50")
+        .arg("./test_files/e.coli-o157.fasta.gz")
+        .arg("./test_files/tiny_virus.fasta")
+        .arg("-o").arg(format!("{}/db", dir))
+        .assert().success().code(0);
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("sketch").arg("-c").arg("50")
+        .arg("./test_files/o157_reads.fastq.gz")
+        .arg("-d").arg(dir)
+        .assert().success().code(0);
+
+    let sample = format!("{}/o157_reads.fastq.gz.sylsp", dir);
+
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let convert = cmd.arg("db-convert").arg(format!("{}/db.syldb", dir))
+        .arg("--screen-c").arg("200")
+        .arg("-o").arg(format!("{}/db2", dir))
+        .output().expect("Output failed");
+    assert!(convert.status.success());
+    let stderr = str::from_utf8(&convert.stderr).expect("not UTF-8").to_string();
+    assert!(
+        stderr.contains("tiny_virus") && stderr.contains("total dense k-mers"),
+        "expected a small-genome warning mentioning tiny_virus and its dense k-mer count, got: {}",
+        stderr
+    );
+
+    // The db is still valid and profiles the normal-sized genome correctly.
+    let two_stage_db = format!("{}/db2.syl2db", dir);
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let output = cmd.arg("profile").arg(&two_stage_db).arg(&sample)
+        .output().expect("Output failed");
+    assert!(output.status.success());
+    let out = str::from_utf8(&output.stdout).expect("not UTF-8").to_string();
+    assert!(out.contains("e.coli-o157.fasta.gz"));
+}
+
+/// The same genome loaded from two different sources in one profile call
+/// (e.g. present in both a .syl2db and a plain .syldb) must trigger a
+/// duplicate-genome warning rather than silently producing nondeterministic
+/// reassignment output.
+#[serial]
+#[test]
+fn test_two_stage_duplicate_genome_warning(){
+    fresh();
+    let dir = "./tests/results/two_stage_dup";
+    let _ = fs::remove_dir_all(dir);
+    fs::create_dir_all(dir).unwrap();
+
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("sketch").arg("-c").arg("50")
+        .arg("./test_files/e.coli-o157.fasta.gz")
+        .arg("-o").arg(format!("{}/db", dir))
+        .assert().success().code(0);
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("sketch").arg("-c").arg("50")
+        .arg("./test_files/o157_reads.fastq.gz")
+        .arg("-d").arg(dir)
+        .assert().success().code(0);
+
+    let sample = format!("{}/o157_reads.fastq.gz.sylsp", dir);
+    let plain_db = format!("{}/db.syldb", dir);
+
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("db-convert").arg(&plain_db)
+        .arg("--screen-c").arg("200")
+        .arg("-o").arg(format!("{}/db2", dir))
+        .assert().success().code(0);
+    let two_stage_db = format!("{}/db2.syl2db", dir);
+
+    // Same genome loaded via both the .syl2db and the plain .syldb it came from.
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let output = cmd.arg("profile").arg(&two_stage_db).arg(&plain_db).arg(&sample)
+        .output().expect("Output failed");
+    assert!(output.status.success(), "duplicate genomes should warn, not fail");
+    let stderr = str::from_utf8(&output.stderr).expect("not UTF-8").to_string();
+    assert!(
+        stderr.contains("appear more than once"),
+        "expected a duplicate-genome warning, got: {}",
+        stderr
+    );
 }
