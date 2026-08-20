@@ -260,6 +260,10 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
         }
     }
 
+    // Threads available per file's own sketching pipeline, given `step` files
+    // are processed concurrently out of the shared `args.threads` budget.
+    let threads_per_file = (args.threads / step.max(1)).max(1);
+
     let read_sketch_files_as_vec = read_sketch_files.clone().into_iter().map(|x| vec![x]).collect::<Vec<Vec<&String>>>();
     read_files.extend(read_sketch_files_as_vec);
     let sequence_index_vec = (0..read_files.len()).collect::<Vec<usize>>();
@@ -271,7 +275,7 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
     chunks.into_iter().for_each(|chunk| {
         chunk.into_par_iter().for_each(|j|{
             let is_sketch = j >= read_files.len() - read_sketch_files.len();
-            let sequence_sketch = get_seq_sketch(&args, &read_files[j], is_sketch, genome_sketches[0].c, genome_sketches[0].k);
+            let sequence_sketch = get_seq_sketch(&args, &read_files[j], is_sketch, genome_sketches[0].c, genome_sketches[0].k, threads_per_file);
             if sequence_sketch.is_some(){
                 let first_read_file = read_files[j][0];
                 let sequence_sketch = sequence_sketch.unwrap();
@@ -559,6 +563,7 @@ fn get_seq_sketch(
     is_sketch_file: bool,
     genome_c: usize,
     genome_k: usize,
+    threads: usize,
 ) -> Option<SequencesSketch> {
     if is_sketch_file {
         let read_file = read_file[0];
@@ -595,12 +600,25 @@ fn get_seq_sketch(
             );
             return None;
         } else {
+            let pipeline_params = crate::parallel_sketch::PipelineParams {
+                batch_records: args.sketch_batch_size,
+                channel_depth: args.sketch_channel_depth,
+                num_shards: args.sketch_shards,
+            };
             if read_file.len() == 1{
-                let read_sketch_opt = sketch_sequences_needle(&read_file[0], args.c, args.k, None, false);
+                let read_sketch_opt = if crate::parallel_sketch::should_use_pipeline(args.no_sketch_pipeline, threads, &read_file[0]) {
+                    crate::parallel_sketch::sketch_sequences_needle_parallel(&read_file[0], args.c, args.k, None, false, threads, &pipeline_params)
+                } else {
+                    sketch_sequences_needle(&read_file[0], args.c, args.k, None, false)
+                };
                 return read_sketch_opt;
             }
             else if read_file.len() == 2{
-                let read_sketch_opt = sketch_pair_sequences(&read_file[0], &read_file[1], args.c, args.k, None, false, DEFAULT_FPR);
+                let read_sketch_opt = if crate::parallel_sketch::should_use_pipeline(args.no_sketch_pipeline, threads, &read_file[0]) {
+                    crate::parallel_sketch::sketch_pair_sequences_parallel(&read_file[0], &read_file[1], args.c, args.k, None, false, DEFAULT_FPR, threads, &pipeline_params)
+                } else {
+                    sketch_pair_sequences(&read_file[0], &read_file[1], args.c, args.k, None, false, DEFAULT_FPR)
+                };
                 return read_sketch_opt;
             }
             else{

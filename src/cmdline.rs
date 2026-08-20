@@ -80,6 +80,19 @@ pub struct SketchArgs {
     pub first_pair: Vec<String>,
     #[clap(short='2',long="second-pairs", multiple=true, help_heading = "PAIRED-END INPUT", help = "Second pairs for paired end reads")]
     pub second_pair: Vec<String>,
+
+    #[clap(long="sketch-batch-size", hidden=true, default_value_t = DEFAULT_SKETCH_BATCH_SIZE,
+        help = "Reads per batch handed from the I/O thread to worker threads in multi-threaded read sketching.")]
+    pub sketch_batch_size: usize,
+    #[clap(long="sketch-channel-depth", hidden=true, default_value_t = DEFAULT_SKETCH_CHANNEL_DEPTH,
+        help = "In-flight batches buffered per worker thread between the I/O thread and worker threads (memory/backpressure knob).")]
+    pub sketch_channel_depth: usize,
+    #[clap(long="sketch-shards", hidden=true,
+        help = "Number of dedup/count shards for multi-threaded read sketching. Default: automatically scaled to worker thread count.")]
+    pub sketch_shards: Option<usize>,
+    #[clap(long="no-sketch-pipeline", hidden=true,
+        help = "Disable the multi-threaded per-file read-sketching pipeline; always use the legacy single-threaded-per-file path.")]
+    pub no_sketch_pipeline: bool,
 }
 
 #[derive(Args)]
@@ -138,6 +151,19 @@ pub struct ContainArgs {
     pub individual: bool,
     #[clap(long="min-spacing", default_value_t = 30, help_heading = "SKETCHING", help = "Minimum spacing between selected k-mers on the database genomes. Does nothing for pre-sketched files")]
     pub min_spacing_kmer: usize,
+
+    #[clap(long="sketch-batch-size", hidden=true, default_value_t = DEFAULT_SKETCH_BATCH_SIZE, help_heading = "SKETCHING",
+        help = "Reads per batch handed from the I/O thread to worker threads in multi-threaded read sketching.")]
+    pub sketch_batch_size: usize,
+    #[clap(long="sketch-channel-depth", hidden=true, default_value_t = DEFAULT_SKETCH_CHANNEL_DEPTH, help_heading = "SKETCHING",
+        help = "In-flight batches buffered per worker thread between the I/O thread and worker threads (memory/backpressure knob).")]
+    pub sketch_channel_depth: usize,
+    #[clap(long="sketch-shards", hidden=true, help_heading = "SKETCHING",
+        help = "Number of dedup/count shards for multi-threaded read sketching. Default: automatically scaled to worker thread count.")]
+    pub sketch_shards: Option<usize>,
+    #[clap(long="no-sketch-pipeline", hidden=true, help_heading = "SKETCHING",
+        help = "Disable the multi-threaded per-file read-sketching pipeline; always use the legacy single-threaded-per-file path.")]
+    pub no_sketch_pipeline: bool,
 
     #[clap(short='o',long="output-file", help = "Output to this file (TSV format). [default: stdout]", help_heading="INPUT/OUTPUT")]
     pub out_file_name: Option<String>,

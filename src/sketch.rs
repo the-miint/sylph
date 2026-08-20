@@ -22,7 +22,7 @@ use std::io::BufWriter;
 use std::io::{prelude::*, BufReader};
 use std::path::Path;
 use std::sync::Mutex;
-type Marker = u32;
+pub(crate) type Marker = u32;
 
 pub fn check_vram_and_block(max_ram: usize, file: &str) {
     if let Some(usage) = memory_stats() {
@@ -309,8 +309,12 @@ pub fn sketch(args: SketchArgs) {
 
     if !first_pairs.is_empty() && !second_pairs.is_empty() {
         info!("Sketching paired sequences...");
-        let iter_vec: Vec<usize> = (0..first_pairs.len()).into_iter().collect();
-        iter_vec.into_par_iter().for_each(|i| {
+        let pipeline_params = crate::parallel_sketch::PipelineParams {
+            batch_records: args.sketch_batch_size,
+            channel_depth: args.sketch_channel_depth,
+            num_shards: args.sketch_shards,
+        };
+        crate::parallel_sketch::run_file_slots(first_pairs.len(), args.threads, |i, slot_threads| {
             let read_file1 = &first_pairs[i];
             let read_file2 = &second_pairs[i];
 
@@ -318,15 +322,33 @@ pub fn sketch(args: SketchArgs) {
             if let Some(name) = &sample_names {
                 sample_name = Some(name[i].clone());
             }
-            let read_sketch_opt = sketch_pair_sequences(
+            let read_sketch_opt = if crate::parallel_sketch::should_use_pipeline(
+                args.no_sketch_pipeline,
+                slot_threads,
                 read_file1,
-                read_file2,
-                args.c,
-                args.k,
-                sample_name.clone(),
-                args.no_dedup,
-                args.fpr,
-            );
+            ) {
+                crate::parallel_sketch::sketch_pair_sequences_parallel(
+                    read_file1,
+                    read_file2,
+                    args.c,
+                    args.k,
+                    sample_name.clone(),
+                    args.no_dedup,
+                    args.fpr,
+                    slot_threads,
+                    &pipeline_params,
+                )
+            } else {
+                sketch_pair_sequences(
+                    read_file1,
+                    read_file2,
+                    args.c,
+                    args.k,
+                    sample_name.clone(),
+                    args.no_dedup,
+                    args.fpr,
+                )
+            };
             if read_sketch_opt.is_some() {
                 let res = fs::create_dir_all(&args.sample_output_dir);
                 if res.is_err() {
@@ -367,8 +389,12 @@ pub fn sketch(args: SketchArgs) {
         info!("Sketching non-paired sequences...");
     }
 
-    let iter_vec: Vec<usize> = (0..read_inputs.len()).into_iter().collect();
-    iter_vec.into_par_iter().for_each(|i| {
+    let pipeline_params = crate::parallel_sketch::PipelineParams {
+        batch_records: args.sketch_batch_size,
+        channel_depth: args.sketch_channel_depth,
+        num_shards: args.sketch_shards,
+    };
+    crate::parallel_sketch::run_file_slots(read_inputs.len(), args.threads, |i, slot_threads| {
         let pref = Path::new(&args.sample_output_dir);
         std::fs::create_dir_all(pref)
             .expect("Could not create directory for output sample files (-d). Exiting...");
@@ -381,14 +407,23 @@ pub fn sketch(args: SketchArgs) {
             sample_name = Some(name[i + first_pairs.len()].clone());
         }
 
-        let read_sketch_opt;
-        read_sketch_opt = sketch_sequences_needle(
+        let read_sketch_opt = if crate::parallel_sketch::should_use_pipeline(
+            args.no_sketch_pipeline,
+            slot_threads,
             read_file,
-            args.c,
-            args.k,
-            sample_name.clone(),
-            args.no_dedup,
-        );
+        ) {
+            crate::parallel_sketch::sketch_sequences_needle_parallel(
+                read_file,
+                args.c,
+                args.k,
+                sample_name.clone(),
+                args.no_dedup,
+                slot_threads,
+                &pipeline_params,
+            )
+        } else {
+            sketch_sequences_needle(read_file, args.c, args.k, sample_name.clone(), args.no_dedup)
+        };
 
         if read_sketch_opt.is_some() {
             let read_sketch = read_sketch_opt.unwrap();
@@ -624,7 +659,7 @@ pub fn sketch_genome(
 }
 
 #[inline]
-fn pair_kmer_single(s1: &[u8]) -> Option<([Marker; 2], [Marker; 2])> {
+pub(crate) fn pair_kmer_single(s1: &[u8]) -> Option<([Marker; 2], [Marker; 2])> {
     let k = std::mem::size_of::<Marker>() * 4;
     if s1.len() < 4 * k + 2 {
         return None;
@@ -658,7 +693,7 @@ fn pair_kmer_single(s1: &[u8]) -> Option<([Marker; 2], [Marker; 2])> {
 }
 
 #[inline]
-fn pair_kmer(s1: &[u8], s2: &[u8]) -> Option<([Marker; 2], [Marker; 2])> {
+pub(crate) fn pair_kmer(s1: &[u8], s2: &[u8]) -> Option<([Marker; 2], [Marker; 2])> {
     let k = std::mem::size_of::<Marker>() * 4;
     if s1.len() < 2 * k + 1 || s2.len() < 2 * k + 1 {
         return None;
@@ -689,7 +724,7 @@ fn pair_kmer(s1: &[u8], s2: &[u8]) -> Option<([Marker; 2], [Marker; 2])> {
     }
 }
 
-fn dup_removal_lsh_full_exact(
+pub(crate) fn dup_removal_lsh_full_exact(
     kmer_counts: &mut FxHashMap<Kmer, u32>,
     kmer_to_pair_set: &mut FxHashSet<(u64, [Marker; 2])>,
     //kmer_to_pair_set: &mut ScalableCuckooFilter<(u64,[Marker;2]), FxHasher>,
@@ -732,10 +767,10 @@ fn dup_removal_lsh_full_exact(
     *c += 1;
 }
 
-fn dup_removal_lsh_full(
+pub(crate) fn dup_removal_lsh_full<R: rand::Rng>(
     kmer_counts: &mut FxHashMap<Kmer, u32>,
     //kmer_to_pair_set: &mut FxHashSet<(u64,[Marker;2])>,
-    kmer_to_pair_set: &mut ScalableCuckooFilter<(u64, [Marker; 2]), FxHasher>,
+    kmer_to_pair_set: &mut ScalableCuckooFilter<(u64, [Marker; 2]), FxHasher, R>,
     //kmer_to_pair_set: &mut GrowableBloom,
     km: &u64,
     kmer_pair: Option<([Marker; 2], [Marker; 2])>,

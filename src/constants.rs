@@ -15,3 +15,14 @@ pub const MAX_DEDUP_COUNT: u32 = 4;
 pub const MAX_DEDUP_LEN: usize = 10000000;
 pub const DEFAULT_FPR: f64 = 0.0001;
 pub const MED_KMER_FOR_ID_EST: f64 = 3.;
+/// Below this (compressed, for .gz inputs) file size, the multi-threaded
+/// producer/consumer read-sketching pipeline isn't worth its setup cost;
+/// fall back to the legacy single-threaded-per-file path regardless of the
+/// available thread budget.
+pub const MIN_BYTES_FOR_SKETCH_PIPELINE: u64 = 4_000_000;
+/// Default reads per batch handed from the sketching pipeline's I/O thread to
+/// worker threads.
+pub const DEFAULT_SKETCH_BATCH_SIZE: usize = 2000;
+/// Default in-flight batches buffered per worker thread between the I/O
+/// thread and worker threads in the sketching pipeline.
+pub const DEFAULT_SKETCH_CHANNEL_DEPTH: usize = 2;
