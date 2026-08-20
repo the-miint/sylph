@@ -439,12 +439,19 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
         }
     }
     else{
-        if args.pseudotax{
-            step = usize::max(args.threads/3 + 1, usize::min(num_raw_read_files, args.threads))
-        }
-        else{
-            step = usize::max(1, usize::min(num_raw_read_files, args.threads))
-        }
+        // Historically `profile` (pseudotax) reserved fewer samples-in-flight
+        // than `query` via the `threads/3 + 1` floor, leaving headroom for the
+        // per-sample reassignment pass. That floor was inert whenever
+        // `num_raw_read_files >= threads/3 + 1` (the common case), since with
+        // single-threaded-per-file sketching `step` only mattered via
+        // `min(step, num_raw_read_files)` in `get_chunks` below -- but it
+        // becomes an active bottleneck now that `step` also sizes
+        // `threads_per_file` for the multi-threaded sketch pipeline: with few
+        // files and many threads, inflating `step` starves each file's
+        // pipeline of threads for no benefit (nested rayon parallelism in the
+        // reassignment pass doesn't need reserved threads; it work-steals from
+        // the same global pool). Match `query`'s formula.
+        step = usize::max(1, usize::min(num_raw_read_files, args.threads))
     }
 
     // Threads available per file's own sketching pipeline, given `step` files
