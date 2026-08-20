@@ -20,12 +20,13 @@ clap = { version = "3", features = ["derive"] }
 flate2 = { version = "1.0.17", features = ["zlib-ng"], default-features = false }
 statrs="0.16"
 nalgebra="0"
-rand = "0"
+rand = { version = "0", features = ["small_rng"] }
 regex = "1"
 fastrand = "2"
 memory-stats = "1"
 scalable_cuckoo_filter = "0.2"
 serde_yaml = "0.9"
+crossbeam-channel = "0"
 
 [target.'cfg(target_env = "musl")'.dependencies]
 tikv-jemallocator = "0"
