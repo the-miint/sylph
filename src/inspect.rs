@@ -75,6 +75,30 @@ pub struct DatabaseSketch{
     pub genome_files: Vec<GenomeSketchInspect>,
 }
 
+#[derive(Deserialize, Serialize, Debug, PartialEq, Default, Clone)]
+pub struct Syl2DbGenomeInspect{
+    pub file_name: String,
+    pub first_contig_name: String,
+    pub gn_size: usize,
+    pub min_spacing: usize,
+    pub has_pseudotax: bool,
+    // Sparse/screen k-mer count -- NOT the dense count (unlike .syldb's
+    // genome_kmers_num above): cheap to report without decoding the dense
+    // Golomb-Rice block, which is the whole point of the format.
+    pub screen_kmers_num: usize,
+}
+
+#[derive(Deserialize, Serialize, Debug, PartialEq, Default, Clone)]
+pub struct Syl2DbInspect{
+    pub database_file: String,
+    pub file_size_bytes: u64,
+    pub c: usize,
+    pub k: usize,
+    pub screen_c: usize,
+    pub num_genomes: usize,
+    pub genomes: Vec<Syl2DbGenomeInspect>,
+}
+
 #[derive(Debug, Default)]
 struct DatabaseVisitor {
     c: Option<usize>,
@@ -122,6 +146,7 @@ pub fn inspect(args: InspectArgs){
 
     let mut read_sketch_files = Vec::new();
     let mut genome_sketch_files = Vec::new();
+    let mut two_stage_db_files = Vec::new();
 
     for file in args.files.iter(){
         let mut genome_sketch_good_suffix = false;
@@ -140,13 +165,15 @@ pub fn inspect(args: InspectArgs){
             }
         }
 
-        if genome_sketch_good_suffix{
+        if file.ends_with(TWO_STAGE_DB_SUFFIX){
+            two_stage_db_files.push(file);
+        } else if genome_sketch_good_suffix{
             genome_sketch_files.push(file);
         } else if sample_sketch_good_suffix{
             read_sketch_files.push(file);
         } else {
             warn!(
-                "{} file is not a .sylsp or .syldb file. Skipping...",
+                "{} file is not a .sylsp, .syldb, or .syl2db file. Skipping...",
                 &file
             );
         }
@@ -166,6 +193,15 @@ pub fn inspect(args: InspectArgs){
     }
     let yaml = serde_yaml::to_string(&db_sketches_inspect).unwrap();
     if !db_sketches_inspect.is_empty(){
+        pipe_write(&yaml, &mut out_writer);
+    }
+
+    let mut syl2db_inspect = Vec::new();
+    for file in two_stage_db_files.iter(){
+        syl2db_inspect.push(get_syl2db_inspect(file));
+    }
+    let yaml = serde_yaml::to_string(&syl2db_inspect).unwrap();
+    if !syl2db_inspect.is_empty(){
         pipe_write(&yaml, &mut out_writer);
     }
 
@@ -212,6 +248,43 @@ fn get_db_sketch_inspect(
         k: visitor.k.unwrap(),
         min_spacing_parameter: visitor.min_spacing.unwrap(),
         genome_files: visitor.sketches,
+    }
+}
+
+fn get_syl2db_inspect(
+    path: &String,
+) -> Syl2DbInspect{
+    let db = crate::twostage_db::open_file(path)
+        .unwrap_or_else(|e| panic!("{} is not a valid two-stage database: {}", path, e));
+    let file_size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+
+    let genomes: Vec<Syl2DbGenomeInspect> = (0..db.len() as u32)
+        .map(|g| {
+            let meta = db.genome_meta(g);
+            Syl2DbGenomeInspect{
+                file_name: meta.file_name.clone(),
+                first_contig_name: meta.first_contig_name.clone(),
+                gn_size: meta.gn_size,
+                min_spacing: meta.min_spacing,
+                has_pseudotax: meta.has_pseudotax,
+                screen_kmers_num: db.screen_index.sparse_count[g as usize] as usize,
+            }
+        })
+        .collect();
+
+    info!(
+        "Two-stage database file {} processed with {} genomes",
+        path, genomes.len()
+    );
+
+    Syl2DbInspect{
+        database_file: path.clone(),
+        file_size_bytes,
+        c: db.c,
+        k: db.k,
+        screen_c: db.screen_c,
+        num_genomes: db.len(),
+        genomes,
     }
 }
 

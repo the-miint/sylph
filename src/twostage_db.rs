@@ -524,33 +524,30 @@ impl ScreenIndex {
 
 // --- writing ----------------------------------------------------------------
 
-/// Every genome's stage-1 sparse set has at least this many k-mers, or all of
-/// its dense k-mers if it has fewer than this to begin with. A genome whose
-/// nominal (`screen_c`) sparse subset would fall short instead uses a denser,
-/// genome-specific rate to reach this floor -- small genomes (viruses,
-/// plasmids, short contigs) would otherwise contribute so few sparse k-mers
-/// that the stage-1 screen could miss them entirely, regardless of sample
-/// coverage.
-const SPARSE_TARGET_MIN: usize = 50;
-/// If even the adaptive floor above can't be reached (i.e. the genome has
-/// fewer than this many k-mers in total, dense included), warn loudly: this
-/// genome will also drag the whole database's effective stage-1 screen rate
-/// down toward its own dense rate (see `write_two_stage_db`), and its
-/// detection reliability at this size is inherently poor.
+/// If even the adaptive floor (see `write_two_stage_db`'s `min_sparse_kmers`
+/// parameter) can't be reached (i.e. the genome has fewer than this many
+/// k-mers in total, dense included), warn loudly: this genome will also drag
+/// the whole database's effective stage-1 screen rate down toward its own
+/// dense rate (see `write_two_stage_db`), and its detection reliability at
+/// this size is inherently poor.
 const SPARSE_WARN_THRESHOLD: usize = 20;
 
 /// Re-pack genome sketches into the two-stage seekable layout and write to `w`.
 /// `screen_c` is the (coarser) stage-1 subsampling rate; it must be `>= c`.
 /// Dense blocks are Golomb-Rice coded. Each genome's sparse stage-1 set is
-/// selected at `screen_c` if that clears `SPARSE_TARGET_MIN`, otherwise at a
-/// denser, genome-specific rate that does (see `SPARSE_TARGET_MIN`); the
-/// database-wide effective screen rate stored in the footer/index is derived
-/// from whichever genome ended up densest, so the pooled screen index's
-/// early-exit filter stays correct for every genome (see `ScreenIndex`).
+/// selected at `screen_c` if that clears `min_sparse_kmers`, otherwise at a
+/// denser, genome-specific rate that does; the database-wide effective screen
+/// rate stored in the footer/index is derived from whichever genome ended up
+/// densest, so the pooled screen index's early-exit filter stays correct for
+/// every genome (see `ScreenIndex`). `min_sparse_kmers` must be `>= 1` --
+/// callers must enforce this (see `run_db_convert`'s validation), since 0
+/// would let a genome's sparse set end up empty, making it silently invisible
+/// to the stage-1 screen forever.
 pub fn write_two_stage_db<W: Write>(
     mut w: W,
     sketches: &[GenomeSketch],
     screen_c: usize,
+    min_sparse_kmers: usize,
 ) -> io::Result<()> {
     let c = sketches.first().map(|s| s.c).unwrap_or(0);
     let k = sketches.first().map(|s| s.k).unwrap_or(0);
@@ -581,7 +578,7 @@ pub fn write_two_stage_db<W: Write>(
         }
 
         let dense_total = gs.genome_kmers.len();
-        let (sparse, genome_thresh): (Vec<u64>, u64) = if dense_total <= SPARSE_TARGET_MIN {
+        let (sparse, genome_thresh): (Vec<u64>, u64) = if dense_total <= min_sparse_kmers {
             // Fewer dense k-mers than the target to begin with -- use them all.
             (gs.genome_kmers.clone(), dense_thresh)
         } else {
@@ -591,16 +588,16 @@ pub fn write_two_stage_db<W: Write>(
                 .copied()
                 .filter(|&h| h < nominal_thresh)
                 .collect();
-            if nominal.len() >= SPARSE_TARGET_MIN {
+            if nominal.len() >= min_sparse_kmers {
                 (nominal, nominal_thresh)
             } else {
-                // Adaptive: select exactly the SPARSE_TARGET_MIN smallest
+                // Adaptive: select exactly the min_sparse_kmers smallest
                 // hashes from the full dense set via O(n) partial selection.
                 warn!("genome '{}' (file {}) has only {} total sparse k-mers (< {} at -c={}), \
                        using a denser genome-specific stage-1 screen rate to reach the target",
-                      gs.first_contig_name, gs.file_name, nominal.len(), SPARSE_TARGET_MIN, screen_c);
+                      gs.first_contig_name, gs.file_name, nominal.len(), min_sparse_kmers, screen_c);
                 let mut v = gs.genome_kmers.clone();
-                let kth = SPARSE_TARGET_MIN - 1;
+                let kth = min_sparse_kmers - 1;
                 v.select_nth_unstable(kth);
                 let kth_val = v[kth];
                 v.truncate(kth + 1);
@@ -608,7 +605,13 @@ pub fn write_two_stage_db<W: Write>(
             }
         };
 
-        if sparse.len() < SPARSE_WARN_THRESHOLD {
+        // The warning below always means "didn't reach your own configured
+        // target": stays at the fixed SPARSE_WARN_THRESHOLD for any target >=
+        // that (the common case), shrinks only if min_sparse_kmers itself was
+        // set below it, so it never misfires on a genome that hit its own
+        // (deliberately small) target.
+        let effective_warn_threshold = SPARSE_WARN_THRESHOLD.min(min_sparse_kmers);
+        if sparse.len() < effective_warn_threshold {
             warn!(
                 "genome '{}' (file {}) has only {} total dense k-mers (< {}); its two-stage \
                  sparse screen entry uses all of them, and because it is (one of) the \
@@ -617,7 +620,7 @@ pub fn write_two_stage_db<W: Write>(
                  speed for every sample. Detection reliability at this size is inherently \
                  poor -- consider excluding tiny genomes/contigs/plasmids from two-stage \
                  databases, or check that this genome/contig was sketched as intended.",
-                gs.first_contig_name, gs.file_name, sparse.len(), SPARSE_WARN_THRESHOLD, c
+                gs.first_contig_name, gs.file_name, sparse.len(), effective_warn_threshold, c
             );
         }
 
@@ -805,6 +808,12 @@ impl TwoStageDb {
         &self.genomes[g as usize].first_contig_name
     }
 
+    /// Full metadata for genome `g` (for `sylph inspect`) -- cheap, no dense
+    /// decode needed, `GenomeMeta` is fully loaded when the database is opened.
+    pub fn genome_meta(&self, g: u32) -> &GenomeMeta {
+        &self.genomes[g as usize]
+    }
+
     /// End offset of genome `g`'s region (start of the next genome's block, or
     /// the screen index for the last genome). Genomes are stored in ascending
     /// offset, and the index block immediately follows the last dense block.
@@ -974,6 +983,12 @@ pub fn run_db_convert(args: DbConvertArgs) {
         );
         std::process::exit(1);
     }
+    if args.min_sparse_kmers == 0 {
+        error!(
+            "--min-sparse-kmers must be >= 1 (0 can silently make small genomes invisible to the stage-1 screen). Exiting"
+        );
+        std::process::exit(1);
+    }
 
     let out = if args.output.ends_with(TWO_STAGE_DB_SUFFIX) {
         args.output.clone()
@@ -994,7 +1009,7 @@ pub fn run_db_convert(args: DbConvertArgs) {
     );
     let w =
         BufWriter::new(File::create(&out).unwrap_or_else(|_| panic!("Could not create {}", out)));
-    write_two_stage_db(w, &sketches, args.screen_c)
+    write_two_stage_db(w, &sketches, args.screen_c, args.min_sparse_kmers)
         .unwrap_or_else(|e| panic!("Failed to write {}: {}", out, e));
     info!("Wrote two-stage database to {}", out);
 }
@@ -1049,9 +1064,9 @@ mod tests {
     #[test]
     fn db_write_open_load_roundtrip() {
         // screen_c = 200 (coarser than c = 50): the sparse subset keeps hashes
-        // below u64::MAX/200. Each genome has > SPARSE_TARGET_MIN dense k-mers
-        // below thresh, so both take the nominal (non-adaptive) branch and the
-        // stored screen_c should round-trip to the requested nominal rate.
+        // below u64::MAX/200. Each genome has > SPARSE_TARGET_MIN_DEFAULT dense
+        // k-mers below thresh, so both take the nominal (non-adaptive) branch
+        // and the stored screen_c should round-trip to the requested nominal rate.
         let thresh = u64::MAX / 200;
         let mut g0_kmers: Vec<u64> = (1..=60u64).collect();
         g0_kmers.extend([thresh - 1, thresh + 10, thresh * 3, 9_000_000_000]);
@@ -1063,14 +1078,14 @@ mod tests {
         ];
 
         let mut buf = Vec::new();
-        write_two_stage_db(&mut buf, &sketches, 200).unwrap();
+        write_two_stage_db(&mut buf, &sketches, 200, SPARSE_TARGET_MIN_DEFAULT).unwrap();
         let db = open(std::io::Cursor::new(buf)).unwrap();
 
         assert_eq!(db.c, 50);
         assert_eq!(db.k, 31);
-        // Both genomes take the nominal branch (>= SPARSE_TARGET_MIN below
-        // thresh), so the effective screen_c round-trips from the nominal one
-        // via the same formula the implementation uses.
+        // Both genomes take the nominal branch (>= SPARSE_TARGET_MIN_DEFAULT
+        // below thresh), so the effective screen_c round-trips from the
+        // nominal one via the same formula the implementation uses.
         let expected_screen_c = (u64::MAX / screen_threshold(200)).max(1) as usize;
         assert_eq!(db.screen_c, expected_screen_c);
         assert_eq!(db.len(), 2);
@@ -1198,8 +1213,8 @@ mod tests {
     #[test]
     fn screen_index_roundtrips_through_db() {
         let thresh = u64::MAX / 200;
-        // Filler below-thresh k-mers push each genome past SPARSE_TARGET_MIN so
-        // both take the nominal (non-adaptive) branch, matching the probe values
+        // Filler below-thresh k-mers push each genome past SPARSE_TARGET_MIN_DEFAULT
+        // so both take the nominal (non-adaptive) branch, matching the probe values
         // used against `sample` below (which assume plain screen_c=200 filtering).
         let mut g0 = vec![5u64, 5, thresh - 1, thresh + 9]; // last is above screen thresh
         g0.extend(1000..1062u64);
@@ -1210,7 +1225,7 @@ mod tests {
             gsketch("g1.fa", g1.clone(), Some(vec![2])),
         ];
         let mut buf = Vec::new();
-        write_two_stage_db(&mut buf, &sketches, 200).unwrap();
+        write_two_stage_db(&mut buf, &sketches, 200, SPARSE_TARGET_MIN_DEFAULT).unwrap();
         let db = open(std::io::Cursor::new(buf)).unwrap();
 
         let sample = sample_from(&[(5, 4), (7, 6), (thresh - 1, 1), (thresh - 2, 9)]);
@@ -1224,9 +1239,9 @@ mod tests {
         assert_eq!(g1h, vec![4, 6, 9]);
     }
 
-    /// Genomes with <= SPARSE_TARGET_MIN total dense k-mers use all of them as
-    /// their sparse set (regardless of the nominal screen_c), and force the
-    /// database-wide effective screen_c down toward the dense rate `c`.
+    /// Genomes with <= SPARSE_TARGET_MIN_DEFAULT total dense k-mers use all of
+    /// them as their sparse set (regardless of the nominal screen_c), and force
+    /// the database-wide effective screen_c down toward the dense rate `c`.
     #[test]
     fn write_two_stage_db_small_genomes_use_all_kmers() {
         let small_a: Vec<u64> = (1..=15u64).collect(); // 15 total: < SPARSE_WARN_THRESHOLD
@@ -1236,25 +1251,25 @@ mod tests {
             gsketch("b.fa", small_b.clone(), None),
         ];
         let mut buf = Vec::new();
-        write_two_stage_db(&mut buf, &sketches, 3000).unwrap();
+        write_two_stage_db(&mut buf, &sketches, 3000, SPARSE_TARGET_MIN_DEFAULT).unwrap();
         let db = open(std::io::Cursor::new(buf)).unwrap();
 
         assert_eq!(db.screen_index.sparse_count[0] as usize, small_a.len());
         assert_eq!(db.screen_index.sparse_count[1] as usize, small_b.len());
 
-        // Both genomes are far below SPARSE_TARGET_MIN, so their genome_thresh
-        // is the DB's own dense threshold (c=50, from `gsketch`) -- the
-        // database-wide effective screen_c collapses toward that.
+        // Both genomes are far below SPARSE_TARGET_MIN_DEFAULT, so their
+        // genome_thresh is the DB's own dense threshold (c=50, from `gsketch`)
+        // -- the database-wide effective screen_c collapses toward that.
         let expected_screen_c = (u64::MAX / screen_threshold(50)).max(1) as usize;
         assert_eq!(db.screen_c, expected_screen_c);
         assert!(db.screen_c < 3000, "small genomes should force a denser effective screen_c");
     }
 
     /// A genome whose nominal (screen_c) sparse subset falls short of
-    /// SPARSE_TARGET_MIN, but which has enough total dense k-mers to clear the
-    /// target, adaptively selects exactly the SPARSE_TARGET_MIN smallest
-    /// hashes -- not just however many happened to be below the nominal
-    /// threshold.
+    /// SPARSE_TARGET_MIN_DEFAULT, but which has enough total dense k-mers to
+    /// clear the target, adaptively selects exactly the SPARSE_TARGET_MIN_DEFAULT
+    /// smallest hashes -- not just however many happened to be below the
+    /// nominal threshold.
     #[test]
     fn write_two_stage_db_adaptive_floor_selects_smallest() {
         let screen_c = 3000usize;
@@ -1269,10 +1284,10 @@ mod tests {
 
         let sketches = vec![gsketch("c.fa", kmers.clone(), None)];
         let mut buf = Vec::new();
-        write_two_stage_db(&mut buf, &sketches, screen_c).unwrap();
+        write_two_stage_db(&mut buf, &sketches, screen_c, SPARSE_TARGET_MIN_DEFAULT).unwrap();
         let db = open(std::io::Cursor::new(buf)).unwrap();
 
-        assert_eq!(db.screen_index.sparse_count[0] as usize, SPARSE_TARGET_MIN);
+        assert_eq!(db.screen_index.sparse_count[0] as usize, SPARSE_TARGET_MIN_DEFAULT);
 
         // The effective screen_c is derived exactly from the 50th-smallest
         // (index 49) k-mer's threshold -- denser (smaller) than the nominal

@@ -113,6 +113,16 @@ fn get_chunks(indices: &Vec<usize>, steps: usize) -> Vec<Vec<usize>>{
     return_chunks
 }
 
+fn minimum_ani_fraction(args: &ContainArgs) -> f64 {
+    if let Some(minimum_ani) = args.minimum_ani {
+        minimum_ani / 100.0
+    } else if args.pseudotax {
+        MIN_ANI_P_DEF
+    } else {
+        MIN_ANI_DEF
+    }
+}
+
 /// Two-stage stage 1 + 2 against one `.syl2db`: screen `sequence_sketch`
 /// against the database's pooled `screen_index` (a single inverted pass over
 /// the sample at the sparse, per-database `screen_c`), then decode and return
@@ -140,14 +150,16 @@ fn compute_dense_survivors(
     // rejected at the dense stage. `db.screen_c` is the *stored* (possibly
     // adaptively-densified, see `write_two_stage_db`) rate, so this scaling
     // automatically becomes less aggressive too when a small genome forced a
-    // denser effective rate.
+    // denser effective rate. `--min-contain` is deliberately deferred to the
+    // decoded dense sketch below: applying an absolute dense evidence floor to
+    // this much sparser screen could discard a valid dense candidate.
     screen_args.min_number_kmers = args.min_number_kmers * db.c as f64 / db.screen_c as f64;
 
     // Stage 1 = "Path B": one inverted pass over the sample produces, per genome,
     // the same matched-coverage multiset the per-genome `get_stats` loop would
-    // collect; feeding it to the same `finalize_stats` + `--screen-min-matches` +
-    // `min_number_kmers` checks reproduces the survivor set exactly, in O(sample)
-    // rather than O(reference) work. (See experiments/7_mphf_screen_again.)
+    // collect; feeding it to the same `finalize_stats` + `min_number_kmers`
+    // checks reproduces the survivor set exactly, in O(sample) rather than
+    // O(reference) work. (See experiments/7_mphf_screen_again.)
     let hits: Vec<(u32, Vec<u32>)> = screen_index
         .gather_hits(sequence_sketch)
         .into_iter()
@@ -167,13 +179,6 @@ fn compute_dense_survivors(
             let contain_count = covs.len();
             // finalize_stats applies the screen min-ANI gate (returns None below it).
             let fin = finalize_stats(&screen_args, db.k, n_kmers, contain_count, covs, None)?;
-            // Require at least `--screen-min-matches` matched screen k-mers; this
-            // cheaply drops genomes that clear the (permissive) screen ANI on only
-            // a few chance-shared k-mers, before they cost a dense decode. Default
-            // 1 == current behaviour (get_stats already needs >= 1 match).
-            if contain_count < args.screen_min_matches {
-                return None;
-            }
             if args.screen_dump.is_some() {
                 dump.lock().unwrap().push((
                     db.genome_file_name(g as u32).to_string(),
@@ -273,6 +278,7 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
     let mut read_files = vec![];
 
     let mut all_files = args.files.clone();
+    all_files.extend(args.databases.clone());
 
     if let Some(ref newline_file) = args.file_list{
         let file = File::open(newline_file).unwrap();
@@ -778,23 +784,26 @@ fn get_seq_sketch(
             &format!("The sketch `{}` is not a valid sketch. Perhaps it is an older incompatible version ", read_sketch_file),
         );
         if read_sketch.c > genome_c {
-            error!("{} value of -c is {}; this is greater than the smallest value of -c = {} for a genome sketch. Exiting.", read_file, read_sketch.c, genome_c);
+            error!("{} is a pre-sketched sample at -c {}; this is sparser than required by the loaded genome sketch(es) (-c {}). A pre-sketched sample can't be re-sketched denser after the fact -- re-sketch it at -c <= {} first, or use a raw fastq input instead. Continuing without sketching.", read_file, read_sketch.c, genome_c, genome_c);
             return None;
         }
         else if read_sketch.c < genome_c{
-            info!("{} value of -c for reads is {}; this is smaller than the -c for a genome sketch. Using the larger -c {} instead.", read_file, read_sketch.c,  genome_c);
+            info!("{} is a pre-sketched sample at -c {}, denser than required by the loaded genome sketch(es) (-c {}) -- using it as-is.", read_file, read_sketch.c, genome_c);
         }
 
         return Some(read_sketch);
     } else {
+        // Raw reads are sketched fresh here, so unlike the pre-sketched-file
+        // branch above there's no unrecoverable case: if the requested -c is
+        // sparser than what the loaded genome(s) need, just sketch at the
+        // denser rate genome_c instead -- never sparser than requested, and
+        // always safe/correct (a sample can't be sparser than any genome it's
+        // compared against).
+        let effective_c = args.c.min(genome_c);
         if args.c > genome_c{
-            info!("{} value of -c for reads is {}; this is smaller than the -c for a genome sketch. Using the larger -c {} instead.", read_file[0], args.c,  genome_c);
+            info!("{} value of -c for reads is {}; this is sparser than required by the loaded genome sketch(es) (-c {}). Sketching at the denser -c {} instead.", read_file[0], args.c, genome_c, effective_c);
         }
-        if genome_c < args.c {
-            error!("{} error: value of -c for contain = {} -- greater than the smallest value of -c for a genome sketch = {}. Continuing without sketching.", read_file[0], args.c, genome_c);
-            return None;
-        } 
-        else if genome_k != args.k {
+        if genome_k != args.k {
             error!(
                 "{} -k {} is not equal to -k {} found in sketches. Continuing without sketching.",
                 read_file[0], args.k, genome_k
@@ -803,22 +812,23 @@ fn get_seq_sketch(
         } else {
             let pipeline_params = crate::parallel_sketch::PipelineParams {
                 batch_records: args.sketch_batch_size,
+                batch_max_bytes: args.sketch_batch_max_bytes,
                 channel_depth: args.sketch_channel_depth,
                 num_shards: args.sketch_shards,
             };
             if read_file.len() == 1{
                 let read_sketch_opt = if crate::parallel_sketch::should_use_pipeline(args.no_sketch_pipeline, threads, &read_file[0]) {
-                    crate::parallel_sketch::sketch_sequences_needle_parallel(&read_file[0], args.c, args.k, None, false, threads, &pipeline_params)
+                    crate::parallel_sketch::sketch_sequences_needle_parallel(&read_file[0], effective_c, args.k, None, false, threads, &pipeline_params)
                 } else {
-                    sketch_sequences_needle(&read_file[0], args.c, args.k, None, false)
+                    sketch_sequences_needle(&read_file[0], effective_c, args.k, None, false)
                 };
                 return read_sketch_opt;
             }
             else if read_file.len() == 2{
                 let read_sketch_opt = if crate::parallel_sketch::should_use_pipeline(args.no_sketch_pipeline, threads, &read_file[0]) {
-                    crate::parallel_sketch::sketch_pair_sequences_parallel(&read_file[0], &read_file[1], args.c, args.k, None, false, DEFAULT_FPR, threads, &pipeline_params)
+                    crate::parallel_sketch::sketch_pair_sequences_parallel(&read_file[0], &read_file[1], effective_c, args.k, None, false, DEFAULT_FPR, threads, &pipeline_params)
                 } else {
-                    sketch_pair_sequences(&read_file[0], &read_file[1], args.c, args.k, None, false, DEFAULT_FPR)
+                    sketch_pair_sequences(&read_file[0], &read_file[1], effective_c, args.k, None, false, DEFAULT_FPR)
                 };
                 return read_sketch_opt;
             }
@@ -855,7 +865,7 @@ fn get_stats<'a>(
     let mut contain_count = 0;
     let mut covs = vec![];
     let gn_kmers = &genome_sketch.genome_kmers;
-    if (gn_kmers.len() as f64) < args.min_number_kmers{
+    if (gn_kmers.len() as f64) < args.min_number_kmers {
         return None
     }
 
@@ -883,6 +893,16 @@ fn get_stats<'a>(
     }
 
     let n_kmers = gn_kmers.len();
+    if contain_count < args.min_contain {
+        log::debug!(
+            "Discarding {}/{}: {} contained k-mers is below the minimum evidence floor {}",
+            genome_sketch.file_name,
+            genome_sketch.first_contig_name,
+            contain_count,
+            args.min_contain,
+        );
+        return None;
+    }
     let reassign_log = if winner_map.is_some() && log_reassign {
         Some((
             genome_sketch.file_name.as_str(),
@@ -1028,13 +1048,7 @@ fn finalize_stats(
         final_est_ani = opt_est_ani.unwrap();
     }
 
-    let min_ani = if args.minimum_ani.is_some() {
-        args.minimum_ani.unwrap() / 100.
-    } else if args.pseudotax {
-        MIN_ANI_P_DEF
-    } else {
-        MIN_ANI_DEF
-    };
+    let min_ani = minimum_ani_fraction(args);
     if final_est_ani < min_ani {
         if let Some((gn, ctg, lost)) = reassign_log {
             log::info!(
@@ -1200,5 +1214,94 @@ fn get_kmer_identity(seq_sketch: &SequencesSketch, estimate_unknown: bool) -> Op
     }
     else{
         return Some(1.)
+    }
+}
+
+#[cfg(test)]
+mod min_number_kmers_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse_contain_args(subcommand: &str, extra_args: &[&str]) -> ContainArgs {
+        let mut argv = vec!["sylph", subcommand];
+        argv.extend_from_slice(extra_args);
+        argv.extend(["database.syldb", "sample.sylsp"]);
+
+        let cli = Cli::try_parse_from(argv).unwrap();
+        match cli.mode {
+            Mode::Profile(mut args) => {
+                args.pseudotax = true;
+                args
+            }
+            Mode::Query(args) => args,
+            _ => panic!("expected profile or query arguments"),
+        }
+    }
+
+    fn synthetic_genome_passes(args: &ContainArgs, genome_kmers: usize, contained: usize) -> bool {
+        let genome = GenomeSketch {
+            genome_kmers: (0..genome_kmers as u64).collect(),
+            pseudotax_tracked_nonused_kmers: Some(vec![]),
+            file_name: "genome".to_string(),
+            first_contig_name: "contig".to_string(),
+            c: 200,
+            k: 31,
+            gn_size: 1_000,
+            min_spacing: 0,
+        };
+        let mut sequence = SequencesSketch::new("sample".to_string(), 200, 31, false, None, 150.0);
+        sequence
+            .kmer_counts
+            .extend((0..contained as u64).map(|kmer| (kmer, 1)));
+
+        get_stats(args, &genome, &sequence, None, false).is_some()
+    }
+
+    #[test]
+    fn min_number_kmers_defaults_to_10() {
+        let args = parse_contain_args("profile", &[]);
+
+        assert_eq!(args.min_number_kmers, 10.0);
+    }
+
+    #[test]
+    fn explicit_min_number_kmers_overrides_default() {
+        let args = parse_contain_args("profile", &["-M", "32.5"]);
+
+        assert_eq!(args.min_number_kmers, 32.5);
+    }
+
+    #[test]
+    fn min_number_kmers_discards_small_genome_sketches() {
+        let mut args = parse_contain_args("profile", &[]);
+        args.minimum_ani = Some(0.0);
+        args.no_ci = true;
+
+        assert!(!synthetic_genome_passes(&args, 9, 9));
+    }
+
+    #[test]
+    fn min_contain_defaults_to_7_for_all_genome_sizes() {
+        let mut args = parse_contain_args("profile", &[]);
+        assert_eq!(args.min_contain, 7);
+
+        args.minimum_ani = Some(0.0);
+        args.no_ci = true;
+
+        assert!(!synthetic_genome_passes(&args, 10, 6));
+        assert!(synthetic_genome_passes(&args, 10, 7));
+        assert!(!synthetic_genome_passes(&args, 500, 6));
+        assert!(synthetic_genome_passes(&args, 500, 7));
+    }
+
+    #[test]
+    fn explicit_min_contain_overrides_default() {
+        let mut args = parse_contain_args("profile", &["--min-contain", "3"]);
+        assert_eq!(args.min_contain, 3);
+
+        args.minimum_ani = Some(0.0);
+        args.no_ci = true;
+        assert!(!synthetic_genome_passes(&args, 500, 2));
+        assert!(synthetic_genome_passes(&args, 500, 3));
     }
 }

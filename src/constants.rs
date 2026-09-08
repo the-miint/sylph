@@ -31,3 +31,12 @@ pub const DEFAULT_SKETCH_BATCH_SIZE: usize = 2000;
 /// Default in-flight batches buffered per worker thread between the I/O
 /// thread and worker threads in the sketching pipeline.
 pub const DEFAULT_SKETCH_CHANNEL_DEPTH: usize = 2;
+/// Default maximum accumulated sequence bytes per sketching-pipeline batch --
+/// a safety cap alongside DEFAULT_SKETCH_BATCH_SIZE, whichever is hit first.
+/// A no-op for typical short-read data (2000 x ~150bp is far below this);
+/// bounds long-read (Nanopore/PacBio) batches, which a fixed record count
+/// alone could otherwise let grow to many tens of megabytes.
+pub const DEFAULT_SKETCH_BATCH_MAX_BYTES: usize = 4_000_000;
+/// Default minimum stage-1 sparse/screen k-mers per genome in a `.syl2db`
+/// (see `write_two_stage_db`'s adaptive floor).
+pub const SPARSE_TARGET_MIN_DEFAULT: usize = 50;

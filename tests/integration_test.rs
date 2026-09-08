@@ -6,10 +6,7 @@ use serial_test::serial;
 use std::process::Command; // Run programs
 
 fn fresh(){
-    Command::new("rm")
-        .arg("-r")
-        .args(["./tests/results/test_sketch_dir"])
-        .spawn();
+    let _ = fs::remove_dir_all("./tests/results/test_sketch_dir");
 }
 
 #[serial]
@@ -469,10 +466,7 @@ fn test_estimate_read_counts(){
         .arg("profile")
         .arg("--estimate-read-counts")
         .arg("./test_files/e.coli-o157.fasta.gz")
-        .arg("-1")
-        .arg("test_files/k12_R1.fq")
-        .arg("-2")
-        .arg("test_files/k12_R2.fq")
+        .arg("./test_files/o157_reads.fastq.gz")
         .output()
         .expect("output failed");
     let stdout_1 = str::from_utf8(&output.stdout).expect("Output was not valid UTF-8");
@@ -489,10 +483,7 @@ fn test_estimate_read_counts(){
     let output = cmd
         .arg("profile")
         .arg("./test_files/e.coli-o157.fasta.gz")
-        .arg("-1")
-        .arg("test_files/k12_R1.fq")
-        .arg("-2")
-        .arg("test_files/k12_R2.fq")
+        .arg("./test_files/o157_reads.fastq.gz")
         .output()
         .expect("output failed");
     let stdout_1 = str::from_utf8(&output.stdout).expect("Output was not valid UTF-8");
@@ -626,13 +617,13 @@ fn test_two_stage_db_convert_and_profile(){
     // Convert the dense db into a two-stage seekable database: dense blocks at
     // c=50, sparse stage-1 screen index at c=200.
     let mut cmd = Command::cargo_bin("sylph").unwrap();
-    cmd.arg("db-convert")
+    cmd.arg("convert-db-two-screen")
         .arg(&dense_db)
         .arg("--screen-c").arg("200")
         .arg("-o").arg(format!("{}/db2", dir))
         .assert().success().code(0);
     let two_stage_db = format!("{}/db2.syl2db", dir);
-    assert!(Path::new(&two_stage_db).exists(), "db-convert did not produce a .syl2db");
+    assert!(Path::new(&two_stage_db).exists(), "convert-db-two-screen did not produce a .syl2db");
     // The two-stage db should be no larger than the dense .syldb it came from
     // (dense blocks are Golomb-Rice compressed; only the small sparse index adds).
     let dense_sz = fs::metadata(&dense_db).unwrap().len();
@@ -686,7 +677,7 @@ fn test_two_stage_individual_records(){
 
     // Dense (-c 50) database built with --individual-records: e.coli-o157 has two
     // records, so multiple database entries share one file name -- the case that
-    // must be preserved per record by db-convert (and rejected by the densify
+    // must be preserved per record by convert-db-two-screen (and rejected by the densify
     // fallback).
     let mut cmd = Command::cargo_bin("sylph").unwrap();
     cmd.arg("sketch").arg("-c").arg("50").arg("-i")
@@ -707,7 +698,7 @@ fn test_two_stage_individual_records(){
 
     // Convert to a two-stage db (per-record blocks are written individually).
     let mut cmd = Command::cargo_bin("sylph").unwrap();
-    cmd.arg("db-convert").arg(&dense_db)
+    cmd.arg("convert-db-two-screen").arg(&dense_db)
         .arg("--screen-c").arg("200")
         .arg("-o").arg(format!("{}/db2", dir))
         .assert().success().code(0);
@@ -738,7 +729,7 @@ fn test_two_stage_individual_records(){
         .output().expect("Output failed");
     let single = str::from_utf8(&single.stdout).expect("not UTF-8").to_string();
 
-    // db-convert + auto-detected two-stage must reproduce single-stage
+    // convert-db-two-screen + auto-detected two-stage must reproduce single-stage
     // per-record detections (no collapsing/merging of records sharing a file
     // name).
     assert_eq!(detected(&two), detected(&single),
@@ -778,7 +769,7 @@ fn test_two_stage_mixed_sources(){
     let sample = format!("{}/o157_reads.fastq.gz.sylsp", dir);
 
     let mut cmd = Command::cargo_bin("sylph").unwrap();
-    cmd.arg("db-convert").arg(format!("{}/db_o157.syldb", dir))
+    cmd.arg("convert-db-two-screen").arg(format!("{}/db_o157.syldb", dir))
         .arg("--screen-c").arg("200")
         .arg("-o").arg(format!("{}/db_o157_2", dir))
         .assert().success().code(0);
@@ -817,7 +808,7 @@ fn test_two_stage_mixed_sources(){
 }
 
 /// A genome with very few total dense k-mers (a short contig/virus) must
-/// trigger the db-convert warning, and the resulting .syl2db must still be
+/// trigger the convert-db-two-screen warning, and the resulting .syl2db must still be
 /// valid and profile the other (normal-sized) genomes correctly.
 #[serial]
 #[test]
@@ -842,7 +833,7 @@ fn test_two_stage_small_genome_warning(){
     let sample = format!("{}/o157_reads.fastq.gz.sylsp", dir);
 
     let mut cmd = Command::cargo_bin("sylph").unwrap();
-    let convert = cmd.arg("db-convert").arg(format!("{}/db.syldb", dir))
+    let convert = cmd.arg("convert-db-two-screen").arg(format!("{}/db.syldb", dir))
         .arg("--screen-c").arg("200")
         .arg("-o").arg(format!("{}/db2", dir))
         .output().expect("Output failed");
@@ -891,7 +882,7 @@ fn test_two_stage_duplicate_genome_warning(){
     let plain_db = format!("{}/db.syldb", dir);
 
     let mut cmd = Command::cargo_bin("sylph").unwrap();
-    cmd.arg("db-convert").arg(&plain_db)
+    cmd.arg("convert-db-two-screen").arg(&plain_db)
         .arg("--screen-c").arg("200")
         .arg("-o").arg(format!("{}/db2", dir))
         .assert().success().code(0);

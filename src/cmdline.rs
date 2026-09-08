@@ -2,7 +2,7 @@ use clap::{Args, Parser, Subcommand};
 use crate::constants::*;
 
 #[derive(Parser)]
-#[clap(author, version, about = "Ultrafast genome ANI queries and taxonomic profiling for metagenomic shotgun samples.\n\n--- Preparing inputs by sketching (indexing)\n## fastq (reads) and fasta (genomes all at once)\n## *.sylsp found in -d; *.syldb given by -o\nsylph sketch -t 5 sample1.fq sample2.fq genome1.fa genome2.fa -o genome1+genome2 -d sample_dir\n\n## paired-end reads\nsylph sketch -1 a_1.fq b_1.fq -2 b_2.fq b_2.fq -d paired_sketches\n\n--- Nearest neighbour containment ANI\nsylph query *.syldb *.sylsp > all-to-all-query.tsv\n\n--- Taxonomic profiling with relative abundances and ANI\nsylph profile *.syldb *.sylsp > all-to-all-profile.tsv", arg_required_else_help = true, disable_help_subcommand = true)]
+#[clap(author, version, about = "Ultrafast genome ANI queries and taxonomic profiling for metagenomic shotgun samples.\n\n--- Preparing inputs by sketching (indexing)\n## fastq (reads) and fasta (genomes all at once)\n## *.sylsp found in -d; *.syldb given by -o\nsylph sketch -t 5 sample1.fq sample2.fq genome1.fa genome2.fa -o genome1+genome2 -d sample_dir\n\n## paired-end reads\nsylph sketch -1 a_1.fq b_1.fq -2 b_2.fq b_2.fq -d paired_sketches\n\n--- Taxonomic profiling with relative abundances and ANI\nsylph profile *.syldb *.sylsp > all-to-all-profile.tsv\n\n--- Direct profiling against database with raw reads\nsylph profile *.syldb -1 sampleA_1.fq -2 sampleA_2.fq", arg_required_else_help = true, disable_help_subcommand = true)]
 pub struct Cli {
     #[clap(subcommand,)]
     pub mode: Mode,
@@ -13,7 +13,7 @@ pub enum Mode {
     /// Sketch sequences into samples (reads) and databases (genomes). Each sample.fq -> sample.sylsp. All *.fa -> *.syldb. 
     #[clap(display_order = 1)]
     Sketch(SketchArgs),
-    /// Coverage-adjusted ANI querying between databases and samples.
+    /// Coverage-adjusted ANI querying between databases and samples without abundances.
     #[clap(display_order = 3)]
     Query(ContainArgs),
     ///Species-level taxonomic profiling with abundances and ANIs. 
@@ -22,9 +22,9 @@ pub enum Mode {
     ///Inspect sketched .syldb and .sylsp files.
     #[clap(arg_required_else_help = true, display_order = 4)]
     Inspect(InspectArgs),
-    ///Convert a standard database (.syldb) into a two-stage seekable database (.syl2db), automatically used by `query`/`profile` when given as input.
     #[clap(arg_required_else_help = true, display_order = 5)]
-    DbConvert(DbConvertArgs),
+    /// Convert a standard database (.syldb) into a two-stage seekable database (.syl2db), automatically used by `query`/`profile` when given as input. Much faster for genomes >~200 kbp with no accuracy change. Keep small genomes/contigs/plasmids in a plain .syldb instead.
+    ConvertDbTwoScreen(DbConvertArgs),
 }
 
 #[derive(Args)]
@@ -35,6 +35,8 @@ pub struct DbConvertArgs {
     pub output: String,
     #[clap(long="screen-c", default_value_t = SCREEN_C_DEFAULT, help = "Subsampling rate -c of the small in-memory stage-1 SCREEN index (the bincoded sparse hashes). Must be >= the database -c. A coarser (larger) value gives a smaller/faster screen index. The dense per-genome blocks always keep every k-mer at the database -c.")]
     pub screen_c: usize,
+    #[clap(long="min-sparse-kmers", default_value_t = SPARSE_TARGET_MIN_DEFAULT, help = "Minimum stage-1 sparse/screen k-mers per genome; genomes whose nominal --screen-c subsample would fall short use a denser, genome-specific screen rate to reach this floor (or all of their dense k-mers if they have fewer than this to begin with). Must be >= 1.")]
+    pub min_sparse_kmers: usize,
     #[clap(short, default_value_t = 3, help = "Number of threads")]
     pub threads: usize,
     #[clap(long="trace", help = "Trace output")]
@@ -79,6 +81,8 @@ pub struct SketchArgs {
     pub c: usize,
     #[clap(short, default_value_t = 3, help = "Number of threads")]
     pub threads: usize,
+    #[clap(short='s', long="sample-threads", help = "Number of input files to sketch concurrently (out of the shared -t/--threads budget); each concurrently-sketched file's own pipeline gets threads / this value threads. Default: min(number of input files, --threads)")]
+    pub sample_threads: Option<usize>,
     #[clap(long="ram-barrier", help = "Stop multi-threaded read sketching when (virtual) RAM is past this value (in GB). Does NOT guarantee max RAM limit", hidden=true)]
     pub max_ram: Option<usize>,
     #[clap(long="trace", help = "Trace output (caution: very verbose)")]
@@ -103,6 +107,9 @@ pub struct SketchArgs {
     #[clap(long="sketch-batch-size", hidden=true, default_value_t = DEFAULT_SKETCH_BATCH_SIZE,
         help = "Reads per batch handed from the I/O thread to worker threads in multi-threaded read sketching.")]
     pub sketch_batch_size: usize,
+    #[clap(long="sketch-batch-max-bytes", hidden=true, default_value_t = DEFAULT_SKETCH_BATCH_MAX_BYTES,
+        help = "Maximum accumulated sequence bytes per batch handed from the I/O thread to worker threads (safety cap alongside --sketch-batch-size; matters mainly for long-read data where a fixed record count can otherwise produce very large batches).")]
+    pub sketch_batch_max_bytes: usize,
     #[clap(long="sketch-channel-depth", hidden=true, default_value_t = DEFAULT_SKETCH_CHANNEL_DEPTH,
         help = "In-flight batches buffered per worker thread between the I/O thread and worker threads (memory/backpressure knob).")]
     pub sketch_channel_depth: usize,
@@ -123,15 +130,20 @@ pub struct ContainArgs {
     #[clap(short='l',long="list", help = "Newline delimited file of file inputs",help_heading = "INPUT/OUTPUT")]
     pub file_list: Option<String>,
 
+    #[clap(short='d', long="databases", multiple=true, help = "Explicitly specify database files (*.syldb/*.syl2db) instead of/in addition to positional input", help_heading = "INPUT/OUTPUT")]
+    pub databases: Vec<String>,
+
     #[clap(long,default_value_t = 3., help_heading = "ALGORITHM", help = "Minimum k-mer multiplicity needed for coverage correction. Higher values gives more precision but lower sensitivity")]
     pub min_count_correct: f64,
-    #[clap(short='M',long,default_value_t = 50., help_heading = "ALGORITHM", help = "Exclude genomes with less than this number of sampled k-mers")]
+    #[clap(short='M',long,default_value_t = 10., help_heading = "ALGORITHM", help = "Discard genomes with fewer than this many sampled k-mers")]
     pub min_number_kmers: f64,
+    #[clap(long="min-contain",default_value_t = 7, help_heading = "ALGORITHM", help = "Minimum number of contained k-mers required for a hit")]
+    pub min_contain: usize,
     #[clap(short, long="minimum-ani", help_heading = "ALGORITHM", help = "Minimum adjusted ANI to consider (0-100). Default is 90 for query and 95 for profile. Smaller than 95 for profile will give inaccurate results." )]
     pub minimum_ani: Option<f64>,
     #[clap(short, default_value_t = 3, help = "Number of threads")]
     pub threads: usize,
-    #[clap(short='s', long="sample-threads", help = "Number of samples to be processed concurrently. Default: (# of total threads / 3) + 1 for profile, 1 for query")]
+    #[clap(short='s', long="sample-threads", help = "Number of samples to be processed concurrently (out of the shared -t/--threads budget); each concurrently-processed sample's own sketching pipeline gets threads / this value threads. Default: min(number of input samples, --threads)")]
     pub sample_threads: Option<usize>,
     #[clap(long="trace", help = "Trace output (caution: very verbose)")]
     pub trace: bool,
@@ -174,6 +186,9 @@ pub struct ContainArgs {
     #[clap(long="sketch-batch-size", hidden=true, default_value_t = DEFAULT_SKETCH_BATCH_SIZE, help_heading = "SKETCHING",
         help = "Reads per batch handed from the I/O thread to worker threads in multi-threaded read sketching.")]
     pub sketch_batch_size: usize,
+    #[clap(long="sketch-batch-max-bytes", hidden=true, default_value_t = DEFAULT_SKETCH_BATCH_MAX_BYTES, help_heading = "SKETCHING",
+        help = "Maximum accumulated sequence bytes per batch handed from the I/O thread to worker threads (safety cap alongside --sketch-batch-size; matters mainly for long-read data where a fixed record count can otherwise produce very large batches).")]
+    pub sketch_batch_max_bytes: usize,
     #[clap(long="sketch-channel-depth", hidden=true, default_value_t = DEFAULT_SKETCH_CHANNEL_DEPTH, help_heading = "SKETCHING",
         help = "In-flight batches buffered per worker thread between the I/O thread and worker threads (memory/backpressure knob).")]
     pub sketch_channel_depth: usize,
@@ -191,8 +206,6 @@ pub struct ContainArgs {
 
     #[clap(long="screen-ani", default_value_t = SCREEN_MIN_ANI_DEFAULT, help_heading = "TWO-STAGE PROFILING", help = "Two-stage databases (.syl2db) only: minimum adjusted ANI (0-100) for a genome to pass the first-stage screen. Deliberately permissive; the dense stage recovers specificity.")]
     pub screen_ani: f64,
-    #[clap(long="screen-min-matches", default_value_t = 1, help_heading = "TWO-STAGE PROFILING", help = "Two-stage databases (.syl2db) only: minimum number of matched stage-1 screen k-mers for a genome to pass the screen and be densely decoded. Default 1 keeps the same results as single-stage; raising it (e.g. with a permissive --screen-ani) cheaply prunes genomes that pass on a handful of chance-shared k-mers, cutting wasted dense decodes at a small sensitivity cost for very-low-coverage genomes.")]
-    pub screen_min_matches: usize,
     #[clap(long="screen-dump", hidden=true, help_heading = "TWO-STAGE PROFILING", help = "Debug: write a TSV of every stage-1 screen survivor (genome, matched/total screen k-mers, naive/adjusted ANI, median coverage) to this file.")]
     pub screen_dump: Option<String>,
 

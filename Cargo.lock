@@ -1194,6 +1194,7 @@ dependencies = [
  "simple_logger",
  "smallvec",
  "statrs",
+ "termcolor",
  "tikv-jemallocator",
 ]
 

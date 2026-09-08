@@ -311,10 +311,11 @@ pub fn sketch(args: SketchArgs) {
         info!("Sketching paired sequences...");
         let pipeline_params = crate::parallel_sketch::PipelineParams {
             batch_records: args.sketch_batch_size,
+            batch_max_bytes: args.sketch_batch_max_bytes,
             channel_depth: args.sketch_channel_depth,
             num_shards: args.sketch_shards,
         };
-        crate::parallel_sketch::run_file_slots(first_pairs.len(), args.threads, |i, slot_threads| {
+        crate::parallel_sketch::run_file_slots(first_pairs.len(), args.threads, args.sample_threads, |i, slot_threads| {
             let read_file1 = &first_pairs[i];
             let read_file2 = &second_pairs[i];
 
@@ -391,10 +392,11 @@ pub fn sketch(args: SketchArgs) {
 
     let pipeline_params = crate::parallel_sketch::PipelineParams {
         batch_records: args.sketch_batch_size,
+        batch_max_bytes: args.sketch_batch_max_bytes,
         channel_depth: args.sketch_channel_depth,
         num_shards: args.sketch_shards,
     };
-    crate::parallel_sketch::run_file_slots(read_inputs.len(), args.threads, |i, slot_threads| {
+    crate::parallel_sketch::run_file_slots(read_inputs.len(), args.threads, args.sample_threads, |i, slot_threads| {
         let pref = Path::new(&args.sample_output_dir);
         std::fs::create_dir_all(pref)
             .expect("Could not create directory for output sample files (-d). Exiting...");

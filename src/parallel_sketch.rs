@@ -61,6 +61,7 @@ type PeBatch = Vec<(Vec<u8>, Vec<u8>)>;
 /// Tunable knobs for the pipeline, threaded down from CLI flags.
 pub struct PipelineParams {
     pub batch_records: usize,
+    pub batch_max_bytes: usize,
     pub channel_depth: usize,
     pub num_shards: Option<usize>,
 }
@@ -69,6 +70,7 @@ impl Default for PipelineParams {
     fn default() -> Self {
         PipelineParams {
             batch_records: DEFAULT_SKETCH_BATCH_SIZE,
+            batch_max_bytes: DEFAULT_SKETCH_BATCH_MAX_BYTES,
             channel_depth: DEFAULT_SKETCH_CHANNEL_DEPTH,
             num_shards: None,
         }
@@ -193,14 +195,23 @@ fn merge_shards(shards: Vec<Shard>) -> (FxHashMap<Kmer, u32>, usize) {
 
 // --- producers -----------------------------------------------------------
 
-fn producer_se(mut reader: Box<dyn FastxReader>, tx: Sender<SeBatch>, batch_records: usize) {
+fn producer_se(
+    mut reader: Box<dyn FastxReader>,
+    tx: Sender<SeBatch>,
+    batch_records: usize,
+    batch_max_bytes: usize,
+) {
     let mut batch: SeBatch = Vec::with_capacity(batch_records);
+    let mut batch_bytes = 0usize;
     while let Some(record) = reader.next() {
         match record {
             Ok(rec) => {
-                batch.push(rec.seq().into_owned());
-                if batch.len() >= batch_records {
+                let seq = rec.seq().into_owned();
+                batch_bytes += seq.len();
+                batch.push(seq);
+                if batch.len() >= batch_records || batch_bytes >= batch_max_bytes {
                     let full = std::mem::replace(&mut batch, Vec::with_capacity(batch_records));
+                    batch_bytes = 0;
                     if tx.send(full).is_err() {
                         return; // consumers gone
                     }
@@ -231,8 +242,10 @@ fn producer_pe(
     mut r2: Box<dyn FastxReader>,
     tx: Sender<PeBatch>,
     batch_records: usize,
+    batch_max_bytes: usize,
 ) -> bool {
     let mut batch: PeBatch = Vec::with_capacity(batch_records);
+    let mut batch_bytes = 0usize;
     loop {
         let (n1, n2) = (r1.next(), r2.next());
         let (rec1_o, rec2_o) = match (n1, n2) {
@@ -247,9 +260,13 @@ fn producer_pe(
             Ok(r) => r,
             Err(_) => continue,
         };
-        batch.push((rec1.seq().into_owned(), rec2.seq().into_owned()));
-        if batch.len() >= batch_records {
+        let seq1 = rec1.seq().into_owned();
+        let seq2 = rec2.seq().into_owned();
+        batch_bytes += seq1.len() + seq2.len();
+        batch.push((seq1, seq2));
+        if batch.len() >= batch_records || batch_bytes >= batch_max_bytes {
             let full = std::mem::replace(&mut batch, Vec::with_capacity(batch_records));
+            batch_bytes = 0;
             if tx.send(full).is_err() {
                 return true;
             }
@@ -275,15 +292,26 @@ enum MateItem {
 /// mates' gzip inflate + FASTQ parsing -- otherwise the paired producer's
 /// entire cost, confirmed empirically to dominate wall time for compressed
 /// input -- run concurrently on separate cores instead of serialized on one.
-fn producer_mate(mut reader: Box<dyn FastxReader>, tx: Sender<Vec<MateItem>>, batch_records: usize) {
+fn producer_mate(
+    mut reader: Box<dyn FastxReader>,
+    tx: Sender<Vec<MateItem>>,
+    batch_records: usize,
+    batch_max_bytes: usize,
+) {
     let mut batch: Vec<MateItem> = Vec::with_capacity(batch_records);
+    let mut batch_bytes = 0usize;
     while let Some(record) = reader.next() {
         batch.push(match record {
-            Ok(rec) => MateItem::Ok(rec.seq().into_owned()),
+            Ok(rec) => {
+                let seq = rec.seq().into_owned();
+                batch_bytes += seq.len();
+                MateItem::Ok(seq)
+            }
             Err(_) => MateItem::ParseErr,
         });
-        if batch.len() >= batch_records {
+        if batch.len() >= batch_records || batch_bytes >= batch_max_bytes {
             let full = std::mem::replace(&mut batch, Vec::with_capacity(batch_records));
+            batch_bytes = 0;
             if tx.send(full).is_err() {
                 return;
             }
@@ -343,17 +371,18 @@ fn run_pe_intake(
     reader2: Box<dyn FastxReader>,
     tx: Sender<PeBatch>,
     batch_records: usize,
+    batch_max_bytes: usize,
     channel_depth: usize,
     use_dual_readers: bool,
 ) -> bool {
     if !use_dual_readers {
-        return producer_pe(reader1, reader2, tx, batch_records);
+        return producer_pe(reader1, reader2, tx, batch_records, batch_max_bytes);
     }
     let (tx1, rx1) = bounded::<Vec<MateItem>>(channel_depth);
     let (tx2, rx2) = bounded::<Vec<MateItem>>(channel_depth);
     std::thread::scope(|scope| {
-        scope.spawn(move || producer_mate(reader1, tx1, batch_records));
-        scope.spawn(move || producer_mate(reader2, tx2, batch_records));
+        scope.spawn(move || producer_mate(reader1, tx1, batch_records, batch_max_bytes));
+        scope.spawn(move || producer_mate(reader2, tx2, batch_records, batch_max_bytes));
         zip_pe(rx1, rx2, tx)
     })
 }
@@ -522,10 +551,11 @@ pub fn sketch_sequences_needle_parallel(
         .unwrap_or_else(|| default_num_shards(num_consumers));
     let (tx, rx) = bounded::<SeBatch>(params.channel_depth * num_consumers);
     let batch_records = params.batch_records;
+    let batch_max_bytes = params.batch_max_bytes;
 
     let (kmer_counts, num_dup_removed, sum_len, count) = if no_dedup {
         std::thread::scope(|scope| {
-            scope.spawn(move || producer_se(reader, tx, batch_records));
+            scope.spawn(move || producer_se(reader, tx, batch_records, batch_max_bytes));
             let handles: Vec<_> = (0..num_consumers)
                 .map(|_| {
                     let rx = rx.clone();
@@ -548,7 +578,7 @@ pub fn sketch_sequences_needle_parallel(
     } else {
         let shards = build_shards_exact(num_shards);
         let (sum_len, count) = std::thread::scope(|scope| {
-            scope.spawn(move || producer_se(reader, tx, batch_records));
+            scope.spawn(move || producer_se(reader, tx, batch_records, batch_max_bytes));
             let handles: Vec<_> = (0..num_consumers)
                 .map(|_| {
                     let rx = rx.clone();
@@ -617,6 +647,7 @@ pub fn sketch_pair_sequences_parallel(
         .unwrap_or_else(|| default_num_shards(num_consumers));
     let (tx, rx) = bounded::<PeBatch>(params.channel_depth * num_consumers);
     let batch_records = params.batch_records;
+    let batch_max_bytes = params.batch_max_bytes;
     let channel_depth = params.channel_depth;
     let exact = dedup_fpr == 0.;
 
@@ -624,7 +655,7 @@ pub fn sketch_pair_sequences_parallel(
     let (kmer_counts, num_dup_removed, sum_len, count) = if no_dedup {
         std::thread::scope(|scope| {
             let prod = scope.spawn(move || {
-                run_pe_intake(reader1, reader2, tx, batch_records, channel_depth, use_dual_readers)
+                run_pe_intake(reader1, reader2, tx, batch_records, batch_max_bytes, channel_depth, use_dual_readers)
             });
             let handles: Vec<_> = (0..num_consumers)
                 .map(|_| {
@@ -656,7 +687,7 @@ pub fn sketch_pair_sequences_parallel(
         };
         let (sum_len, count) = std::thread::scope(|scope| {
             let prod = scope.spawn(move || {
-                run_pe_intake(reader1, reader2, tx, batch_records, channel_depth, use_dual_readers)
+                run_pe_intake(reader1, reader2, tx, batch_records, batch_max_bytes, channel_depth, use_dual_readers)
             });
             let handles: Vec<_> = (0..num_consumers)
                 .map(|_| {
@@ -718,25 +749,33 @@ fn log_dedup_stats(file_name: &str, kmer_counts: &FxHashMap<Kmer, u32>, num_dup_
 // --- outer file-level scheduling -----------------------------------------
 
 /// Runs `per_file(file_index, threads_for_this_file)` for every file in
-/// `0..num_files`, using `files_in_flight = min(num_files, total_threads)`
-/// concurrent slots pulling from a shared work queue (so a slot that
-/// finishes a small file quickly immediately grabs the next one, rather than
-/// files being statically pre-partitioned). Any threads left over after
-/// giving each slot a base share are rationed evenly across the first few
-/// slots. Slots are plain `std::thread::scope` threads, not rayon tasks --
-/// each slot's `per_file` call itself spawns and blocks on its own dedicated
-/// producer+consumer threads, and nesting raw thread spawns inside a rayon
-/// closure would leave rayon unable to account for them.
+/// `0..num_files`, using `files_in_flight` concurrent slots pulling from a
+/// shared work queue (so a slot that finishes a small file quickly
+/// immediately grabs the next one, rather than files being statically
+/// pre-partitioned). By default `files_in_flight = min(num_files,
+/// total_threads)`; `sample_threads` overrides this with the same
+/// `Some(n>0)`/`Some(0)`/`None` semantics `contain()`'s `-s/--sample-threads`
+/// already has (`Some(0)` means 1 file at a time). Any threads left over
+/// after giving each slot a base share are rationed evenly across the first
+/// few slots. Slots are plain `std::thread::scope` threads, not rayon tasks
+/// -- each slot's `per_file` call itself spawns and blocks on its own
+/// dedicated producer+consumer threads, and nesting raw thread spawns inside
+/// a rayon closure would leave rayon unable to account for them.
 pub fn run_file_slots<T: Send>(
     num_files: usize,
     total_threads: usize,
+    sample_threads: Option<usize>,
     per_file: impl Fn(usize, usize) -> T + Sync,
 ) -> Vec<T> {
     if num_files == 0 {
         return Vec::new();
     }
-    let files_in_flight = num_files.min(total_threads.max(1));
-    let threads_per_file = (total_threads / files_in_flight).max(1);
+    let files_in_flight = match sample_threads {
+        Some(n) if n > 0 => n,
+        Some(_) => 1,
+        None => num_files.min(total_threads.max(1)),
+    };
+    let threads_per_file = (total_threads / files_in_flight.max(1)).max(1);
     let remainder = total_threads.saturating_sub(threads_per_file * files_in_flight);
     let queue: Mutex<VecDeque<usize>> = Mutex::new((0..num_files).collect());
     let results: Vec<Mutex<Option<T>>> = (0..num_files).map(|_| Mutex::new(None)).collect();
@@ -812,6 +851,7 @@ mod tests {
         // thread counts.
         PipelineParams {
             batch_records: 64,
+            batch_max_bytes: usize::MAX,
             channel_depth: 2,
             num_shards: Some(num_shards),
         }
@@ -1000,7 +1040,7 @@ mod tests {
     #[test]
     fn run_file_slots_covers_every_file_exactly_once() {
         let seen: Vec<Mutex<u32>> = (0..7).map(|_| Mutex::new(0)).collect();
-        let results = run_file_slots(7, 3, |idx, threads| {
+        let results = run_file_slots(7, 3, None, |idx, threads| {
             *seen[idx].lock().unwrap() += 1;
             assert!(threads >= 1);
             idx * 2
