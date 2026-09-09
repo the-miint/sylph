@@ -41,8 +41,11 @@
 //! **Stage 2 (dense, Golomb-Rice, loaded on demand).** Each genome's *full*
 //! `genome_kmers` and `pseudotax_tracked_nonused_kmers` are an independently
 //! Golomb-Rice-coded block at a known offset. Only the genomes that pass the
-//! stage-1 screen are decoded (and cached across samples) to reconstruct their
-//! exact `GenomeSketch` for the dense profiling pass.
+//! stage-1 screen are decoded. The profiling path intentionally does not retain
+//! decoded blocks across samples: its permissive screen can admit many genomes
+//! that fail the dense pass, and caching that growing union would trade away the
+//! format's bounded-RSS advantage. `load_dense` remains available to callers
+//! whose workload has a known-small, repeatedly accessed working set.
 
 use crate::cmdline::DbConvertArgs;
 use crate::constants::*;
@@ -876,6 +879,11 @@ impl TwoStageDb {
     }
 
     /// Decode genome `g`'s full dense `GenomeSketch`, caching it across calls.
+    ///
+    /// This cache is unbounded. The profiling path deliberately uses
+    /// `decode_dense` instead, because caching every permissive screen survivor
+    /// across a large or diverse sample cohort can eventually retain a large
+    /// fraction of the dense database in memory.
     pub fn load_dense(&self, g: u32) -> io::Result<Arc<GenomeSketch>> {
         if let Some(a) = self.cache.lock().unwrap().get(&g) {
             return Ok(a.clone());

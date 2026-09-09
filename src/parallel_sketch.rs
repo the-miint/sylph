@@ -21,13 +21,14 @@
 //! the same signature). To parallelize it without a single global lock (which
 //! would serialize everything) or per-consumer-private dedup state (which
 //! would silently miss duplicates whose two occurrences land on different
-//! consumers), dedup+count state is split into `NUM_SHARDS` independent,
-//! individually-locked shards, and every k-mer from a given read/pair is
-//! routed to the SAME shard via `hash(pair_signature) % NUM_SHARDS` --
-//! guaranteeing true duplicates always collide in the same shard regardless of
-//! which consumer processed which read, or how many shards exist. A whole
-//! batch's results are grouped by shard locally before any lock is taken, so
-//! each touched shard is locked at most once per batch, not once per read.
+//! consumers), dedup+count state is split into independent, individually-locked
+//! shards. Every observation of a k-mer is routed by that k-mer's hash, so its
+//! count and all of its `(k-mer, pair-signature)` dedup keys always live in the
+//! same shard. This is required by the single-end `MAX_DEDUP_COUNT` escape
+//! threshold, which must see the k-mer's global count rather than one partial
+//! count per signature shard. A whole batch's results are grouped by shard
+//! locally before any lock is taken, so each touched shard is locked at most
+//! once per batch, not once per observation.
 //!
 //! `--no-dedup` mode needs none of this: with no correctness dependency on
 //! shard placement, each consumer just accumulates into a fully thread-local
@@ -82,15 +83,10 @@ fn default_num_shards(num_consumers: usize) -> usize {
 }
 
 #[inline]
-fn shard_of_sig(sig: &PairSig, num_shards: usize) -> usize {
-    (fxhash::hash64(sig) as usize) % num_shards
-}
-
-#[inline]
 fn shard_of_kmer(km: u64, num_shards: usize) -> usize {
-    // `km` is already a Murmur-style hash (see seeding.rs), well-distributed
-    // on its own -- used only for the (rare) items with no pair_sig to route
-    // by, purely for load balance across shards.
+    // `km` is already a Murmur-style hash (see seeding.rs), so its low bits are
+    // suitable for balancing ownership across the power-of-two default shard
+    // counts without hashing it again.
     (km as usize) % num_shards
 }
 
@@ -130,12 +126,16 @@ fn build_shards_approx(num_shards: usize, dedup_fpr: f64) -> Vec<Shard> {
     // comparable (the filter is scalable/grows past this regardless).
     let cap = (10_000_000usize / num_shards.max(1)).max(1000);
     (0..num_shards)
-        .map(|_| {
+        .map(|shard_index| {
             let filter = ScalableCuckooFilterBuilder::new()
                 .initial_capacity(cap)
                 .false_positive_probability(fpr)
                 .hasher(FxHasher::default())
-                .rng(SmallRng::from_entropy())
+                // Keep approximate dedup repeatable while giving independent
+                // shards distinct relocation streams.
+                .rng(SmallRng::seed_from_u64(
+                    DEFAULT_RNG_SEED.wrapping_add(shard_index as u64),
+                ))
                 .finish();
             Shard(Mutex::new(ShardState {
                 dedup: Dedup::Approx(Box::new(filter)),
@@ -148,8 +148,8 @@ fn build_shards_approx(num_shards: usize, dedup_fpr: f64) -> Vec<Shard> {
 
 /// Thin adapter over the existing (unchanged) `dup_removal_lsh_full[_exact]`
 /// bodies, re-pointed at one shard's state instead of a single-threaded
-/// local -- this is what keeps the shard-based dedup logic identical to the
-/// sequential path rather than a parallel reimplementation that could drift.
+/// local -- this keeps the shard-based dedup rules aligned with the sequential
+/// path. Observation order can still differ between consumers.
 fn dedup_and_count(
     state: &mut ShardState,
     km: u64,
@@ -411,10 +411,7 @@ fn consumer_se(
             scratch.clear();
             extract_markers(seq, &mut scratch, c, k);
             for &km in scratch.iter() {
-                let idx = match pair_sig {
-                    Some(sig) => shard_of_sig(&sig, shards.len()),
-                    None => shard_of_kmer(km, shards.len()),
-                };
+                let idx = shard_of_kmer(km, shards.len());
                 outbox[idx].push((km, pair_sig));
             }
         }
@@ -463,27 +460,23 @@ fn consumer_pe(
     for batch in rx.iter() {
         for (seq1, seq2) in &batch {
             count += 1;
-            sum_len += seq1.len() as u64; // matches sketch_pair_sequences: mate-1 length only
+            // Keep the combined length until the final division so odd mate
+            // totals retain their half-base contribution to the mean.
+            sum_len += seq1.len() as u64 + seq2.len() as u64;
             let pair_sig = pair_kmer(seq1, seq2);
             scratch1.clear();
             scratch2.clear();
             extract_markers(seq1, &mut scratch1, c, k);
             extract_markers(seq2, &mut scratch2, c, k);
             for &km in scratch1.iter() {
-                let idx = match pair_sig {
-                    Some(sig) => shard_of_sig(&sig, shards.len()),
-                    None => shard_of_kmer(km, shards.len()),
-                };
+                let idx = shard_of_kmer(km, shards.len());
                 outbox[idx].push((km, pair_sig));
             }
             for &km in scratch2.iter() {
                 if scratch1.contains(&km) {
                     continue; // cross-mate suppression, matches sketch.rs
                 }
-                let idx = match pair_sig {
-                    Some(sig) => shard_of_sig(&sig, shards.len()),
-                    None => shard_of_kmer(km, shards.len()),
-                };
+                let idx = shard_of_kmer(km, shards.len());
                 outbox[idx].push((km, pair_sig));
             }
         }
@@ -508,7 +501,9 @@ fn consumer_pe_no_dedup(rx: Receiver<PeBatch>, c: usize, k: usize) -> (FxHashMap
     for batch in rx.iter() {
         for (seq1, seq2) in &batch {
             count += 1;
-            sum_len += seq1.len() as u64;
+            // Keep the combined length until the final division so odd mate
+            // totals retain their half-base contribution to the mean.
+            sum_len += seq1.len() as u64 + seq2.len() as u64;
             scratch1.clear();
             scratch2.clear();
             extract_markers(seq1, &mut scratch1, c, k);
@@ -717,7 +712,7 @@ pub fn sketch_pair_sequences_parallel(
     }
 
     let mean_read_length = if count > 0 {
-        sum_len as f64 / count as f64
+        sum_len as f64 / (2.0 * count as f64)
     } else {
         0.0
     };
@@ -911,10 +906,8 @@ mod tests {
     }
 
     /// Paired-end, exact dedup (`dedup_fpr = 0.`) -- the primary target use
-    /// case. Correctness here rests entirely on routing every k-mer from a
-    /// pair by the SAME pair-signature hash, so true duplicates (which always
-    /// share a signature) always land in the same shard regardless of thread
-    /// or shard count.
+    /// case. Routing by k-mer keeps every dedup key for that k-mer in the same
+    /// shard regardless of thread or shard count.
     #[test]
     fn parallel_matches_sequential_pe_exact_dedup() {
         let seq = sketch_pair_sequences(K12_R1, K12_R2, C, K, None, false, 0.).unwrap();
@@ -976,10 +969,9 @@ mod tests {
         let _ = std::fs::remove_file(gz2);
     }
 
-    /// Single-end exact dedup on a low-coverage fixture: every true k-mer
-    /// multiplicity here is well under `MAX_DEDUP_COUNT`, so the accepted
-    /// per-shard-vs-global `MAX_DEDUP_COUNT` divergence (see module docs)
-    /// never engages, and equality should hold exactly.
+    /// Single-end exact dedup on a low-coverage fixture. Equality should hold
+    /// exactly across shard counts because each k-mer and its global count now
+    /// have one owning shard.
     #[test]
     fn parallel_matches_sequential_se_exact_dedup_low_coverage() {
         let seq = sketch_sequences_needle(K12_R1, C, K, None, false).unwrap();
@@ -1008,9 +1000,74 @@ mod tests {
         }
     }
 
-    /// Approximate (cuckoo-filter) paired dedup is already RNG/insertion-
-    /// order-dependent even sequentially, so this checks statistical
-    /// closeness rather than bit-for-bit equality.
+    /// Exercise the single-end escape threshold with duplicated reads carrying
+    /// different signatures but shared k-mers. One consumer makes observation
+    /// order identical to the sequential path; multiple shards verify that a
+    /// k-mer's global count is not fragmented by those signatures.
+    #[test]
+    fn parallel_matches_sequential_se_exact_dedup_above_threshold() {
+        let path = std::env::temp_dir().join(format!(
+            "sylph_test_se_dedup_threshold_{}.fq",
+            std::process::id()
+        ));
+        let mut file = std::fs::File::create(&path).unwrap();
+        let bases = [b'A', b'C', b'G', b'T'];
+        for group in 0..8u64 {
+            let mut state = group + 1;
+            let mut seq = vec![b'A'; 200];
+            for base in &mut seq[..150] {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                *base = bases[((state >> 32) & 3) as usize];
+            }
+            // Every signature group shares this independently generated tail,
+            // and therefore many k-mers whose global counts cross the limit.
+            state = 0x5eed;
+            for base in &mut seq[150..] {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                *base = bases[((state >> 32) & 3) as usize];
+            }
+            for copy in 0..2 {
+                writeln!(
+                    file,
+                    "@group{}_copy{}\n{}\n+\n{}",
+                    group,
+                    copy,
+                    String::from_utf8_lossy(&seq),
+                    "I".repeat(seq.len())
+                )
+                .unwrap();
+            }
+        }
+        drop(file);
+
+        let path_str = path.to_str().unwrap();
+        let sequential = sketch_sequences_needle(path_str, 1, K, None, false).unwrap();
+        assert!(
+            sequential.kmer_counts.values().any(|&count| count > MAX_DEDUP_COUNT),
+            "sanity: fixture must cross the single-end dedup threshold"
+        );
+        let parallel = sketch_sequences_needle_parallel(
+            path_str,
+            1,
+            K,
+            None,
+            false,
+            2, // one producer and one consumer: preserve sequential ordering
+            &small_params(16),
+        )
+        .unwrap();
+        assert_eq!(sequential.kmer_counts, parallel.kmer_counts);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Approximate (cuckoo-filter) paired dedup remains insertion-order- and
+    /// filter-layout-dependent, so differently sharded execution is checked
+    /// for statistical closeness rather than bit-for-bit equality.
     #[test]
     fn parallel_close_to_sequential_pe_approx_dedup() {
         let seq = sketch_pair_sequences(K12_R1, K12_R2, C, K, None, false, DEFAULT_FPR).unwrap();
@@ -1035,6 +1092,88 @@ mod tests {
             sum_seq,
             sum_par
         );
+    }
+
+    #[test]
+    fn seeded_approx_dedup_repeats_with_fixed_observation_order() {
+        // One consumer preserves input order. One shard also matches the
+        // sequential filter's capacity, seed, and insertion stream.
+        let params = small_params(1);
+        let first = sketch_pair_sequences_parallel(
+            K12_R1,
+            K12_R2,
+            C,
+            K,
+            None,
+            false,
+            DEFAULT_FPR,
+            2,
+            &params,
+        )
+        .unwrap();
+        let second = sketch_pair_sequences_parallel(
+            K12_R1,
+            K12_R2,
+            C,
+            K,
+            None,
+            false,
+            DEFAULT_FPR,
+            2,
+            &params,
+        )
+        .unwrap();
+        let sequential =
+            sketch_pair_sequences(K12_R1, K12_R2, C, K, None, false, DEFAULT_FPR).unwrap();
+
+        assert_eq!(first.kmer_counts, second.kmer_counts);
+        assert_eq!(sequential.kmer_counts, first.kmer_counts);
+    }
+
+    #[test]
+    fn parallel_pe_mean_length_uses_both_mates_without_integer_rounding() {
+        let path1 = std::env::temp_dir().join(format!(
+            "sylph_test_unequal_mates_1_{}.fq",
+            std::process::id()
+        ));
+        let path2 = std::env::temp_dir().join(format!(
+            "sylph_test_unequal_mates_2_{}.fq",
+            std::process::id()
+        ));
+        let write_fastq = |path: &std::path::Path, lengths: &[usize]| {
+            let mut file = std::fs::File::create(path).unwrap();
+            for (i, &len) in lengths.iter().enumerate() {
+                writeln!(file, "@read{}\n{}\n+\n{}", i, "A".repeat(len), "I".repeat(len))
+                    .unwrap();
+            }
+        };
+        write_fastq(&path1, &[42, 57]);
+        write_fastq(&path2, &[43, 60]);
+
+        let path1_str = path1.to_str().unwrap();
+        let path2_str = path2.to_str().unwrap();
+        let expected = (42.0 + 43.0 + 57.0 + 60.0) / 4.0;
+        for &no_dedup in &[false, true] {
+            let sequential =
+                sketch_pair_sequences(path1_str, path2_str, C, K, None, no_dedup, 0.).unwrap();
+            let parallel = sketch_pair_sequences_parallel(
+                path1_str,
+                path2_str,
+                C,
+                K,
+                None,
+                no_dedup,
+                0.,
+                4,
+                &small_params(16),
+            )
+            .unwrap();
+            assert_eq!(sequential.mean_read_length, expected);
+            assert_eq!(parallel.mean_read_length, expected);
+        }
+
+        let _ = std::fs::remove_file(path1);
+        let _ = std::fs::remove_file(path2);
     }
 
     #[test]

@@ -5,6 +5,8 @@
     - This new format can be obtained via `sylph convert-db-two-screen`. 
 - Made read sketching multi-threaded (thanks to Ben Woodcroft for showing preliminary results)
 - Changed CLI help interface. 
+- Added the `-d` option to specify databases for `sylph profile`. 
+- Default sensitivity increased for small genomes. Min number of k-mers for a genome (`-M`) is set to 10 now, but 7 k-mer hits are required at minimum
 
 # sylph v0.9.0: 10-13-2025
 

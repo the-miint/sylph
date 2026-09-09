@@ -14,6 +14,8 @@ pub const DEREP_PROFILE_ANI: f64 = 0.975;
 pub const MAX_DEDUP_COUNT: u32 = 4;
 pub const MAX_DEDUP_LEN: usize = 10000000;
 pub const DEFAULT_FPR: f64 = 0.0001;
+/// Base seed for algorithms whose output must be repeatable across runs.
+pub const DEFAULT_RNG_SEED: u64 = 7;
 pub const MED_KMER_FOR_ID_EST: f64 = 3.;
 pub const SCREEN_C_DEFAULT: usize = 3000;
 pub const SCREEN_MIN_ANI_DEFAULT: f64 = 85.;

@@ -1,4 +1,5 @@
 use crate::cmdline::*;
+use rand::{rngs::SmallRng, SeedableRng};
 use scalable_cuckoo_filter::ScalableCuckooFilter;
 use scalable_cuckoo_filter::ScalableCuckooFilterBuilder;
 
@@ -840,10 +841,11 @@ pub fn sketch_pair_sequences(
         .initial_capacity(1_000_000_0)
         .false_positive_probability(fpr)
         .hasher(FxHasher::default())
+        .rng(SmallRng::seed_from_u64(DEFAULT_RNG_SEED))
         .finish();
 
-    let mut mean_read_length: f64 = 0.;
-    let mut counter: f64 = 0.;
+    let mut total_read_length: u64 = 0;
+    let mut num_read_pairs: u64 = 0;
 
     loop {
         let n1 = reader1.next();
@@ -859,10 +861,8 @@ pub fn sketch_pair_sequences(
                         extract_markers(&rec2.seq(), &mut temp_vec2, c, k);
                         let kmer_pair = pair_kmer(&rec1.seq(), &rec2.seq());
 
-                        //moving average
-                        counter += 1.;
-                        mean_read_length = mean_read_length
-                            + ((rec1.seq().len() as f64) - mean_read_length) / counter;
+                        num_read_pairs += 1;
+                        total_read_length += rec1.seq().len() as u64 + rec2.seq().len() as u64;
 
                         for km in temp_vec1.iter() {
                             if dedup_fpr == 0. {
@@ -929,7 +929,11 @@ pub fn sketch_pair_sequences(
         num_dup_removed,
         percent,
     );
-    read_sketch.mean_read_length = mean_read_length;
+    read_sketch.mean_read_length = if num_read_pairs > 0 {
+        total_read_length as f64 / (2.0 * num_read_pairs as f64)
+    } else {
+        0.0
+    };
     return Some(read_sketch);
 }
 

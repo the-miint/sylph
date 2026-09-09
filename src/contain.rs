@@ -1118,7 +1118,9 @@ fn bootstrap_interval(
     k: f64,
     args: &ContainArgs,
 ) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
-    fastrand::seed(7);
+    // A local generator avoids mutating thread-local global RNG state when
+    // genomes are finalized concurrently through rayon.
+    let mut rng = fastrand::Rng::with_seed(DEFAULT_RNG_SEED);
     let num_samp = covs_full.len();
     let iters = 100;
     let mut res_ani = vec![];
@@ -1128,7 +1130,7 @@ fn bootstrap_interval(
         let mut rand_vec = vec![];
         rand_vec.reserve(num_samp);
         for _ in 0..num_samp {
-            rand_vec.push(covs_full[fastrand::usize(..covs_full.len())]);
+            rand_vec.push(covs_full[rng.usize(..covs_full.len())]);
         }
         let lambda;
         if args.ratio {
