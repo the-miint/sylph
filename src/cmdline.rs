@@ -37,6 +37,8 @@ pub struct DbConvertArgs {
     pub screen_c: usize,
     #[clap(long="min-sparse-kmers", default_value_t = SPARSE_TARGET_MIN_DEFAULT, help = "Minimum stage-1 sparse/screen k-mers per genome; genomes whose nominal --screen-c subsample would fall short use a denser, genome-specific screen rate to reach this floor (or all of their dense k-mers if they have fewer than this to begin with). Must be >= 1.")]
     pub min_sparse_kmers: usize,
+    #[clap(long="min-contain",default_value_t = 7, help_heading = "ALGORITHM", help = "Throw away genomes with fewer than this many dense k-mers (they could never pass `profile`/`query`'s hit threshold at the matching default anyway, or are likely erroneous/fragmentary genomes). Set to 7 in line with default profiling options. ")]
+    pub min_contain: usize,
     #[clap(short, default_value_t = 3, help = "Number of threads")]
     pub threads: usize,
     #[clap(long="trace", help = "Trace output")]

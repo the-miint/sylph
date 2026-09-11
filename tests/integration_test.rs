@@ -832,9 +832,13 @@ fn test_two_stage_small_genome_warning(){
 
     let sample = format!("{}/o157_reads.fastq.gz.sylsp", dir);
 
+    // --min-contain 0 disables the (unrelated) default dense-k-mer-count
+    // exclusion, so tiny_virus is kept in the db and hits the adaptive-floor
+    // sparse-screen path below instead of being dropped outright.
     let mut cmd = Command::cargo_bin("sylph").unwrap();
     let convert = cmd.arg("convert-db-two-screen").arg(format!("{}/db.syldb", dir))
         .arg("--screen-c").arg("200")
+        .arg("--min-contain").arg("0")
         .arg("-o").arg(format!("{}/db2", dir))
         .output().expect("Output failed");
     assert!(convert.status.success());
@@ -853,6 +857,49 @@ fn test_two_stage_small_genome_warning(){
     assert!(output.status.success());
     let out = str::from_utf8(&output.stdout).expect("not UTF-8").to_string();
     assert!(out.contains("e.coli-o157.fasta.gz"));
+}
+
+/// By default (`--min-contain 7`), genomes with fewer dense k-mers than the
+/// `profile`/`query` hit threshold are dropped from the two-stage db entirely,
+/// with a warning -- rather than kept only to silently never be reported.
+#[serial]
+#[test]
+fn test_two_stage_min_contain_excludes_tiny_genome(){
+    fresh();
+    let dir = "./tests/results/two_stage_min_contain";
+    let _ = fs::remove_dir_all(dir);
+    fs::create_dir_all(dir).unwrap();
+
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("sketch").arg("-c").arg("50")
+        .arg("./test_files/e.coli-o157.fasta.gz")
+        .arg("./test_files/tiny_virus.fasta")
+        .arg("-o").arg(format!("{}/db", dir))
+        .assert().success().code(0);
+
+    // Default --min-contain (7): tiny_virus has only 4 dense k-mers at -c 50,
+    // so it's excluded with a warning rather than silently kept-but-unreachable.
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let convert = cmd.arg("convert-db-two-screen").arg(format!("{}/db.syldb", dir))
+        .arg("--screen-c").arg("200")
+        .arg("-o").arg(format!("{}/db2", dir))
+        .output().expect("Output failed");
+    assert!(convert.status.success());
+    let stderr = str::from_utf8(&convert.stderr).expect("not UTF-8").to_string();
+    assert!(
+        stderr.contains("tiny_virus") && stderr.contains("--min-contain=7") && stderr.contains("excluded"),
+        "expected a --min-contain exclusion warning mentioning tiny_virus, got: {}",
+        stderr
+    );
+
+    let two_stage_db = format!("{}/db2.syl2db", dir);
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let output = cmd.arg("inspect").arg(&two_stage_db)
+        .output().expect("Output failed");
+    assert!(output.status.success());
+    let out = str::from_utf8(&output.stdout).expect("not UTF-8").to_string();
+    assert!(out.contains("e.coli-o157"), "surviving genome should still be present: {}", out);
+    assert!(!out.contains("tiny_virus"), "excluded genome should not be present: {}", out);
 }
 
 /// The same genome loaded from two different sources in one profile call

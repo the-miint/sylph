@@ -551,6 +551,7 @@ pub fn write_two_stage_db<W: Write>(
     sketches: &[GenomeSketch],
     screen_c: usize,
     min_sparse_kmers: usize,
+    min_contain: usize,
 ) -> io::Result<()> {
     let c = sketches.first().map(|s| s.c).unwrap_or(0);
     let k = sketches.first().map(|s| s.k).unwrap_or(0);
@@ -570,6 +571,18 @@ pub fn write_two_stage_db<W: Write>(
     let mut thresh_needed: u64 = 0;
 
     for gs in sketches {
+        let dense_total = gs.genome_kmers.len();
+        if dense_total < min_contain {
+            warn!(
+                "genome '{}' (file {}) has only {} dense k-mers (< --min-contain={}); it would \
+                 never pass `profile`/`query`'s hit threshold at that setting anyway (or is \
+                 likely an erroneous/fragmentary genome), so it is excluded from this two-stage \
+                 database.",
+                gs.first_contig_name, gs.file_name, dense_total, min_contain
+            );
+            continue;
+        }
+
         let dense_offset = HEADER_LEN + body.len() as u64;
         write_hashes(&mut body, &gs.genome_kmers);
         match &gs.pseudotax_tracked_nonused_kmers {
@@ -580,7 +593,6 @@ pub fn write_two_stage_db<W: Write>(
             None => body.push(0),
         }
 
-        let dense_total = gs.genome_kmers.len();
         let (sparse, genome_thresh): (Vec<u64>, u64) = if dense_total <= min_sparse_kmers {
             // Fewer dense k-mers than the target to begin with -- use them all.
             (gs.genome_kmers.clone(), dense_thresh)
@@ -637,6 +649,17 @@ pub fn write_two_stage_db<W: Write>(
             has_pseudotax: gs.pseudotax_tracked_nonused_kmers.is_some(),
             dense_offset,
         });
+    }
+
+    if genomes.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "all {} input genome(s) have fewer than --min-contain={} dense k-mers; nothing to write",
+                sketches.len(),
+                min_contain
+            ),
+        ));
     }
 
     // Database-wide effective screen rate: safe by the number-theory identity
@@ -1017,7 +1040,7 @@ pub fn run_db_convert(args: DbConvertArgs) {
     );
     let w =
         BufWriter::new(File::create(&out).unwrap_or_else(|_| panic!("Could not create {}", out)));
-    write_two_stage_db(w, &sketches, args.screen_c, args.min_sparse_kmers)
+    write_two_stage_db(w, &sketches, args.screen_c, args.min_sparse_kmers, args.min_contain)
         .unwrap_or_else(|e| panic!("Failed to write {}: {}", out, e));
     info!("Wrote two-stage database to {}", out);
 }
@@ -1086,7 +1109,7 @@ mod tests {
         ];
 
         let mut buf = Vec::new();
-        write_two_stage_db(&mut buf, &sketches, 200, SPARSE_TARGET_MIN_DEFAULT).unwrap();
+        write_two_stage_db(&mut buf, &sketches, 200, SPARSE_TARGET_MIN_DEFAULT, 0).unwrap();
         let db = open(std::io::Cursor::new(buf)).unwrap();
 
         assert_eq!(db.c, 50);
@@ -1233,7 +1256,7 @@ mod tests {
             gsketch("g1.fa", g1.clone(), Some(vec![2])),
         ];
         let mut buf = Vec::new();
-        write_two_stage_db(&mut buf, &sketches, 200, SPARSE_TARGET_MIN_DEFAULT).unwrap();
+        write_two_stage_db(&mut buf, &sketches, 200, SPARSE_TARGET_MIN_DEFAULT, 0).unwrap();
         let db = open(std::io::Cursor::new(buf)).unwrap();
 
         let sample = sample_from(&[(5, 4), (7, 6), (thresh - 1, 1), (thresh - 2, 9)]);
@@ -1259,7 +1282,7 @@ mod tests {
             gsketch("b.fa", small_b.clone(), None),
         ];
         let mut buf = Vec::new();
-        write_two_stage_db(&mut buf, &sketches, 3000, SPARSE_TARGET_MIN_DEFAULT).unwrap();
+        write_two_stage_db(&mut buf, &sketches, 3000, SPARSE_TARGET_MIN_DEFAULT, 0).unwrap();
         let db = open(std::io::Cursor::new(buf)).unwrap();
 
         assert_eq!(db.screen_index.sparse_count[0] as usize, small_a.len());
@@ -1292,7 +1315,7 @@ mod tests {
 
         let sketches = vec![gsketch("c.fa", kmers.clone(), None)];
         let mut buf = Vec::new();
-        write_two_stage_db(&mut buf, &sketches, screen_c, SPARSE_TARGET_MIN_DEFAULT).unwrap();
+        write_two_stage_db(&mut buf, &sketches, screen_c, SPARSE_TARGET_MIN_DEFAULT, 0).unwrap();
         let db = open(std::io::Cursor::new(buf)).unwrap();
 
         assert_eq!(db.screen_index.sparse_count[0] as usize, SPARSE_TARGET_MIN_DEFAULT);
