@@ -23,7 +23,7 @@ pub enum Mode {
     #[clap(arg_required_else_help = true, display_order = 4)]
     Inspect(InspectArgs),
     #[clap(arg_required_else_help = true, display_order = 5)]
-    /// Convert a standard database (.syldb) into a two-stage seekable database (.syl2db), automatically used by `query`/`profile` when given as input. Much faster for genomes >~200 kbp with no accuracy change. Not for plasmids / viruses.  
+    /// Convert a standard database (.syldb) into a two-stage seekable database (.syl2db), automatically used by `query`/`profile` when given as input. Much faster for genomes >~200 kbp with no accuracy change. Don't use for small genomes. 
     ConvertDbTwoScreen(DbConvertArgs),
 }
 
