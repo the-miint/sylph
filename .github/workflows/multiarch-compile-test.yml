@@ -1,0 +1,31 @@
+name: "Multi-arch build test"
+
+# Manual only ("Run workflow" button in the Actions tab) -- no push/PR trigger.
+on:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: "Build + sylph -h (${{ matrix.name }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "Linux x86-64"
+            os: ubuntu-latest
+          - name: "Linux ARM64"
+            os: ubuntu-24.04-arm
+          - name: "macOS ARM64"
+            os: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Run sylph -h
+        run: ./target/release/sylph -h
