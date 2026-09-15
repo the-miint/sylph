@@ -2,14 +2,15 @@
 
 <p align="center"><img src="assets/jay_logo.png" width = 450 /></p>
 
-**sylph** is a tool for ultrafast taxonomic profiling of metagenomic shotgun reads. 
+ 
+> [!IMPORTANT]
+> Documentation for sylph has moved to https://sylph-docs.github.io/. All GitHub documentation (e.g., Wikis) are out of date. 
+
+**Sylph** is a tool for ultrafast taxonomic profiling of metagenomic shotgun reads. 
 
 Sylph can profile metagenomes against ~200,000 prokaryotic species (GTDB-R232) with < 5 GB of RAM and < 30 seconds. Sylph is often > 50x faster than other methods and detects very few false postive species. 
 
 Documentation, installation, and usage information https://sylph-docs.github.io/.
- 
-> [!IMPORTANT]
-> Documentation for sylph has moved to https://sylph-docs.github.io/. All GitHub documentation (e.g., Wikis) are out of date. 
 
 ## Citing sylph
 
