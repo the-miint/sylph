@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "fastx"), allow(dead_code, unused_imports))]
 use crate::cmdline::*;
 use rand::{rngs::SmallRng, SeedableRng};
 use scalable_cuckoo_filter::ScalableCuckooFilter;
@@ -15,6 +16,7 @@ use crate::constants::*;
 use crate::seeding::*;
 use crate::types::*;
 use log::*;
+#[cfg(feature = "fastx")]
 use needletail::parse_fastx_file;
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -274,6 +276,7 @@ fn parse_sample_names(args: &SketchArgs) -> Option<Vec<String>> {
     }
 }
 
+#[cfg(feature = "fastx")]
 pub fn sketch(args: SketchArgs) {
     let mut read_inputs = vec![];
     let mut genome_inputs = vec![];
@@ -516,6 +519,7 @@ pub fn sketch(args: SketchArgs) {
     info!("Finished.");
 }
 
+#[cfg(feature = "fastx")]
 pub fn sketch_genome_individual(
     c: usize,
     k: usize,
@@ -586,6 +590,7 @@ pub fn sketch_genome_individual(
     }
 }
 
+#[cfg(feature = "fastx")]
 pub fn sketch_genome(
     c: usize,
     k: usize,
@@ -808,6 +813,7 @@ pub(crate) fn dup_removal_lsh_full<R: rand::Rng>(
     *c += 1;
 }
 
+#[cfg(feature = "fastx")]
 pub fn sketch_pair_sequences(
     read_file1: &str,
     read_file2: &str,
@@ -937,6 +943,7 @@ pub fn sketch_pair_sequences(
     return Some(read_sketch);
 }
 
+#[cfg(feature = "fastx")]
 pub fn sketch_sequences_needle(
     read_file: &str,
     c: usize,

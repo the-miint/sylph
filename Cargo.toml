@@ -6,8 +6,19 @@ license = "MIT OR Apache-2.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+# `--no-default-features` builds the library alone (profile_api, builders):
+# no needletail, no musl jemalloc, no binary.
+[[bin]]
+name = "sylph"
+path = "src/main.rs"
+required-features = ["fastx"]
+
+[features]
+default = ["fastx"]
+fastx = ["dep:needletail", "dep:tikv-jemallocator"]
+
 [dependencies]
-needletail = "0.5.0"
+needletail = { version = "0.5.0", optional = true }
 simple_logger=  { version = "3", features = ["stderr"] }
 log = "0"
 rayon = "1"
@@ -30,7 +41,7 @@ serde_yaml = "0.9"
 crossbeam-channel = "0.5"
 
 [target.'cfg(target_env = "musl")'.dependencies]
-tikv-jemallocator = "0"
+tikv-jemallocator = { version = "0", optional = true }
 
 
 [dev-dependencies]

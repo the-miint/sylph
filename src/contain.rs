@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "fastx"), allow(dead_code, unused_imports))]
 use crate::cmdline::*;
 use std::path::Path;
 use std::io::prelude::*;
@@ -231,6 +232,7 @@ fn compute_dense_survivors(
     dense
 }
 
+#[cfg(feature = "fastx")]
 pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
 
     if pseudotax_in{
@@ -702,6 +704,7 @@ fn print_header(pseudotax: bool, writer: &mut Box<dyn Write + Send>, estimate_un
     }
 }
 
+#[cfg(feature = "fastx")]
 fn get_genome_sketches(
     args: &ContainArgs,
     genome_sketch_files: &Vec<&String>,
@@ -764,6 +767,7 @@ fn get_genome_sketches(
     return genome_sketches.into_inner().unwrap();
 }
 
+#[cfg(feature = "fastx")]
 fn get_seq_sketch(
     args: &ContainArgs,
     read_file: &Vec<&String>,
