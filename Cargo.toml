@@ -6,8 +6,29 @@ license = "MIT OR Apache-2.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+# duckdb-miint embeds sylph as a static library (see sylph.h / src/c_api.rs).
+# The `rlib` type is what the miint-rust-glue umbrella crate links.
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+# The CLI needs file-based FASTX parsing; it is skipped entirely when the crate
+# is built without `fastx` (the duckdb-miint static-lib configuration).
+[[bin]]
+name = "sylph"
+path = "src/main.rs"
+required-features = ["fastx"]
+
+[features]
+default = ["fastx"]
+# File-based FASTA/FASTQ parsing via needletail (with bzip2/xz C libraries).
+# Off in duckdb-miint, which feeds sequences from memory through src/builders.rs
+# and must not pull duplicate compression libraries into the host link.
+fastx = ["dep:needletail"]
+# Arrow C Data Interface export for sylph_profile (src/c_api.rs).
+arrow-ffi = ["dep:arrow"]
+
 [dependencies]
-needletail = "0.5.0"
+needletail = { version = "0.5.0", optional = true }
 simple_logger=  { version = "3", features = ["stderr"] }
 log = "0"
 rayon = "1"
@@ -18,7 +39,8 @@ fxhash = "0"
 boomphf = { version = "0.6", features = ["serde"] }
 clap = { version = "3", features = ["derive"] }
 termcolor = "1"
-flate2 = { version = "1.0.17", features = ["zlib-ng"], default-features = false }
+# rust_backend (not zlib-ng): the duckdb-miint host already links its own zlib.
+flate2 = { version = "1.0.17", features = ["rust_backend"], default-features = false }
 statrs="0.16"
 nalgebra="0"
 rand = { version = "0.8", features = ["small_rng"] }
@@ -28,9 +50,9 @@ memory-stats = "1"
 scalable_cuckoo_filter = "0.2"
 serde_yaml = "0.9"
 crossbeam-channel = "0.5"
+arrow = { version = "59", default-features = false, features = ["ffi"], optional = true }
 
-[target.'cfg(target_env = "musl")'.dependencies]
-tikv-jemallocator = "0"
+# tikv-jemallocator (musl) removed: the duckdb-miint host owns the allocator.
 
 
 [dev-dependencies]
@@ -40,7 +62,7 @@ serial_test = "*"
 
 
 [profile.release]
-panic = "abort"
+# panic = "abort" removed: src/c_api.rs relies on catch_unwind at every FFI entry.
 lto = true
 
 [profile.dev]

@@ -8,16 +8,6 @@ use sylph::twostage_db;
 use termcolor::{BufferWriter, Color, ColorChoice, ColorSpec, WriteColor};
 //use std::panic::set_hook;
 
-//Use this allocator when statically compiling
-//instead of the default
-//because the musl statically compiled binary
-//uses a bad default allocator which makes the
-//binary take 60% longer!!! Only affects
-//static compilation though.
-#[cfg(target_env = "musl")]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
 /// `sketch`/`profile` are the primary day-to-day commands; `query`/`inspect`/
 /// `convert-db-two-screen` are secondary/advanced. clap 3.2's subcommand
 /// listing only supports one flat heading (no per-group headings, derive or
