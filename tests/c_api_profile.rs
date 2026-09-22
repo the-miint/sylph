@@ -32,7 +32,10 @@ fn build_tiny_syldb() -> PathBuf {
         .map(|p| sketch_genome(C, K, p, MIN_SPACING, true).expect("genome sketch"))
         .collect();
     let dir = std::env::temp_dir();
-    let path = dir.join(format!("sylph_c_api_profile_test_{}.syldb", std::process::id()));
+    let path = dir.join(format!(
+        "sylph_c_api_profile_test_{}.syldb",
+        std::process::id()
+    ));
     let f = std::fs::File::create(&path).expect("create temp syldb");
     bincode::serialize_into(f, &genomes).expect("serialize");
     path
@@ -80,7 +83,8 @@ fn ffi_profile_recovers_k12_at_full_abundance() {
         let sketch = sylph_sketch_builder_create(ptr::null());
         assert!(!sketch.is_null());
         for (a, b) in r1.iter().zip(r2.iter()) {
-            let rc = sylph_sketch_builder_add_pair(sketch, a.as_ptr(), a.len(), b.as_ptr(), b.len());
+            let rc =
+                sylph_sketch_builder_add_pair(sketch, a.as_ptr(), a.len(), b.as_ptr(), b.len());
             assert_eq!(rc, 0, "add_pair: {}", err_msg());
         }
         assert_eq!(sylph_sketch_builder_finalize(sketch), 0);
@@ -89,7 +93,13 @@ fn ffi_profile_recovers_k12_at_full_abundance() {
         let mut out_array = std::mem::MaybeUninit::<FFI_ArrowArray>::uninit();
         let mut out_schema = std::mem::MaybeUninit::<FFI_ArrowSchema>::uninit();
 
-        let rc = sylph_profile(db, sketch, &params, out_array.as_mut_ptr(), out_schema.as_mut_ptr());
+        let rc = sylph_profile(
+            db,
+            sketch,
+            &params,
+            out_array.as_mut_ptr(),
+            out_schema.as_mut_ptr(),
+        );
         assert_eq!(rc, 0, "sylph_profile: {}", err_msg());
 
         // Decode the FFI output into an arrow ArrayData / RecordBatch.
@@ -128,7 +138,11 @@ fn ffi_profile_recovers_k12_at_full_abundance() {
             ]
         );
 
-        let _idx_col = batch.column(0).as_any().downcast_ref::<UInt32Array>().unwrap();
+        let _idx_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
         let names_col = batch
             .column(1)
             .as_any()
@@ -156,7 +170,11 @@ fn ffi_profile_recovers_k12_at_full_abundance() {
             .unwrap();
         let _ = kmers_reassigned;
 
-        assert!(names_col.value(0).contains("K12"), "expected K12, got {}", names_col.value(0));
+        assert!(
+            names_col.value(0).contains("K12"),
+            "expected K12, got {}",
+            names_col.value(0)
+        );
         assert!(
             (seq_ab.value(0) - 100.0).abs() < 0.01,
             "sequence_abundance: expected ~100, got {}",
@@ -178,4 +196,98 @@ fn ffi_profile_recovers_k12_at_full_abundance() {
     }
 
     let _ = std::fs::remove_file(&syldb_path);
+}
+
+/// Decode a sylph_profile batch to (genome_name, taxonomic_abundance, adjusted_ani).
+unsafe fn profile_rows(
+    db: *const sylph::c_api::SylphDatabase,
+    sketch: *const sylph::c_api::SylphSketch,
+    params: &SylphProfileParams,
+) -> Vec<(String, f64, f64)> {
+    use arrow::array::{Array, Float64Array, LargeStringArray, RecordBatch, StructArray};
+    use arrow::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
+    let mut out_array = std::mem::MaybeUninit::<FFI_ArrowArray>::uninit();
+    let mut out_schema = std::mem::MaybeUninit::<FFI_ArrowSchema>::uninit();
+    let rc = sylph_profile(
+        db,
+        sketch,
+        params,
+        out_array.as_mut_ptr(),
+        out_schema.as_mut_ptr(),
+    );
+    assert_eq!(rc, 0, "sylph_profile: {}", err_msg());
+    let array_data =
+        from_ffi(out_array.assume_init(), &out_schema.assume_init()).expect("from_ffi");
+    let batch = RecordBatch::from(&StructArray::from(array_data));
+    let names = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<LargeStringArray>()
+        .unwrap();
+    let tax = batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let ani = batch
+        .column(5)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    (0..batch.num_rows())
+        .map(|i| (names.value(i).to_string(), tax.value(i), ani.value(i)))
+        .collect()
+}
+
+/// Through the C ABI, a `.syl2db` and the `.syldb` it was converted from give
+/// identical profiles; the host does not need to know which one it opened.
+#[test]
+fn ffi_profile_two_stage_matches_plain() {
+    use sylph::c_api::sylph_database_is_two_stage;
+    use sylph::twostage_db::write_two_stage_db;
+
+    let syldb_path = build_tiny_syldb();
+    let syl2db_path = syldb_path.with_extension("syl2db");
+    {
+        let genomes: Vec<sylph::types::GenomeSketch> = bincode::deserialize_from(
+            std::io::BufReader::new(std::fs::File::open(&syldb_path).unwrap()),
+        )
+        .unwrap();
+        let w = std::io::BufWriter::new(std::fs::File::create(&syl2db_path).unwrap());
+        write_two_stage_db(w, &genomes, 3000, 50, 7).expect("write two-stage db");
+    }
+    let r1 = slurp_fastq("test_files/k12_R1.fq");
+    let r2 = slurp_fastq("test_files/k12_R2.fq");
+
+    unsafe {
+        let sketch = sylph_sketch_builder_create(ptr::null());
+        for (a, b) in r1.iter().zip(r2.iter()) {
+            assert_eq!(
+                sylph_sketch_builder_add_pair(sketch, a.as_ptr(), a.len(), b.as_ptr(), b.len()),
+                0
+            );
+        }
+        assert_eq!(sylph_sketch_builder_finalize(sketch), 0);
+
+        let c_plain = CString::new(syldb_path.to_string_lossy().as_bytes()).unwrap();
+        let c_two = CString::new(syl2db_path.to_string_lossy().as_bytes()).unwrap();
+        let plain = sylph_database_load(c_plain.as_ptr());
+        let two = sylph_database_load(c_two.as_ptr());
+        assert!(!plain.is_null() && !two.is_null(), "load: {}", err_msg());
+        assert_eq!(sylph_database_is_two_stage(plain), 0);
+        assert_eq!(sylph_database_is_two_stage(two), 1);
+
+        let params = SylphProfileParams::default();
+        assert_eq!(params.screen_ani, 0.0, "0 = sylph's default screen ANI");
+        let rows_plain = profile_rows(plain, sketch, &params);
+        let rows_two = profile_rows(two, sketch, &params);
+        assert_eq!(rows_plain.len(), 1, "K12 only");
+        assert_eq!(rows_plain, rows_two);
+
+        sylph_sketch_free(sketch);
+        sylph_database_free(plain);
+        sylph_database_free(two);
+    }
+    let _ = std::fs::remove_file(&syldb_path);
+    let _ = std::fs::remove_file(&syl2db_path);
 }

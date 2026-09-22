@@ -13,9 +13,10 @@
 
 use crate::cmdline::ContainArgs;
 use crate::contain::{
-    derep_if_reassign_threshold, estimate_covered_bases, estimate_true_cov, get_kmer_identity,
-    get_stats, winner_table,
+    compute_dense_survivors, derep_if_reassign_threshold, estimate_covered_bases,
+    estimate_true_cov, get_kmer_identity, get_stats, winner_table,
 };
+use crate::twostage_db::TwoStageDb;
 use crate::types::{AdjustStatus, AniResult, GenomeSketch, SequencesSketch};
 use clap::Parser;
 use rayon::prelude::*;
@@ -70,6 +71,10 @@ pub struct ProfileArgs {
     pub seq_id: Option<f64>,
     pub redundant_ani: f64,
     pub log_reassignments: bool,
+    /// Two-stage (`.syl2db`) databases only: minimum adjusted ANI in percent for
+    /// a genome to pass the stage-1 screen (`--screen-ani`). `None` uses sylph's
+    /// default. Ignored for plain `.syldb` databases.
+    pub screen_ani: Option<f64>,
     /// Number of rayon worker threads to use for the per-genome inner loop.
     /// `0` means "let rayon decide" (uses the global pool).
     pub num_threads: usize,
@@ -103,6 +108,7 @@ impl Default for ProfileArgs {
             seq_id: None,
             redundant_ani: d.redundant_ani,
             log_reassignments: false,
+            screen_ani: None,
             num_threads: 0,
         }
     }
@@ -155,6 +161,9 @@ impl ProfileArgs {
         }
         if let Some(id) = self.seq_id {
             opt("--read-seq-id", id.to_string());
+        }
+        if let Some(s) = self.screen_ani {
+            opt("--screen-ani", s.to_string());
         }
         let mut args = ContainArgsCli::try_parse_from(&argv)
             .unwrap_or_else(|e| panic!("ProfileArgs -> ContainArgs: {e} (argv {argv:?})"))
@@ -248,10 +257,37 @@ pub fn run_profile_compute(
     if genomes.is_empty() {
         return Vec::new();
     }
+    with_thread_pool(args, || run_profile_compute_inner(genomes, sample, args))
+}
 
-    // Optional rayon thread-pool override. The duckdb-miint table function
-    // uses this to either give all cores to a single sample (one sample, N
-    // threads) or one thread per sample when many samples run in parallel.
+/// Two-stage (`.syl2db`) counterpart of [`run_profile_compute`]: run sylph's
+/// stage-1 screen over the pooled sparse index, decode the dense sketches of
+/// the genomes that pass (`contain::compute_dense_survivors`, exactly what
+/// `sylph profile` does for a `.syl2db` input), then run the same kernels on
+/// them. The screen is an optimisation, not a different model: for the genomes
+/// it keeps, results are identical to the plain path.
+pub fn run_profile_compute_two_stage(
+    db: &TwoStageDb,
+    sample: &SequencesSketch,
+    args: &ProfileArgs,
+) -> Vec<OwnedAniResult> {
+    if db.is_empty() {
+        return Vec::new();
+    }
+    with_thread_pool(args, || {
+        let contain_args = args.to_contain_args();
+        let survivors = compute_dense_survivors(&contain_args, db, sample);
+        if survivors.is_empty() {
+            return Vec::new();
+        }
+        run_profile_compute_inner(&survivors, sample, args)
+    })
+}
+
+/// Optional rayon thread-pool override. The duckdb-miint table function uses
+/// this to either give all cores to a single sample (one sample, N threads) or
+/// one thread per sample when many samples run in parallel. `0` = global pool.
+fn with_thread_pool<R: Send>(args: &ProfileArgs, compute: impl FnOnce() -> R + Send) -> R {
     let owned_pool = if args.num_threads > 0 {
         rayon::ThreadPoolBuilder::new()
             .num_threads(args.num_threads)
@@ -260,13 +296,9 @@ pub fn run_profile_compute(
     } else {
         None
     };
-
-    let compute = || run_profile_compute_inner(genomes, sample, args);
-
-    if let Some(pool) = owned_pool {
-        pool.install(compute)
-    } else {
-        compute()
+    match owned_pool {
+        Some(pool) => pool.install(compute),
+        None => compute(),
     }
 }
 

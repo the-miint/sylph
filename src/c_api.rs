@@ -16,11 +16,13 @@
 #![allow(clippy::missing_safety_doc)]
 
 use crate::builders::{GenomeSketchBuilder, SketchPairBuilder};
+use crate::twostage_db::{self, TwoStageDb};
 use crate::types::{GenomeSketch, SequencesSketch};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr, CString};
 use std::fs::File;
+use std::io::Read;
 use std::io::{BufReader, BufWriter};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
@@ -104,18 +106,28 @@ pub extern "C" fn sylph_miint_fork_version() -> *const c_char {
 }
 
 // ============================================================================
-// Database (opaque .syldb handle)
+// Database (opaque handle: plain .syldb or two-stage .syl2db)
 // ============================================================================
 
-/// Loaded `.syldb`. Immutable, freely shareable across threads for `profile`.
+/// Loaded reference database. Immutable, freely shareable across threads for
+/// `profile` (the two-stage variant's dense-block cache is internally locked).
 pub struct SylphDatabase {
-    pub(crate) genomes: Vec<GenomeSketch>,
+    pub(crate) inner: DbInner,
 }
 
-/// Load a `.syldb` from disk.
+pub(crate) enum DbInner {
+    /// `.syldb`: bincode-serialized `Vec<GenomeSketch>`, fully resident.
+    Plain(Vec<GenomeSketch>),
+    /// `.syl2db`: stage-1 screen index resident, dense blocks read on demand.
+    TwoStage(TwoStageDb),
+}
+
+/// Load a `.syldb` or `.syl2db` from disk; the format is detected from the
+/// file's magic bytes, not its name.
 ///
 /// Returns NULL on error; call `sylph_get_last_error()` for details.
-/// The file format is bincode-serialized `Vec<GenomeSketch>` (unchanged since sylph 0.9.0).
+/// The `.syldb` format is bincode-serialized `Vec<GenomeSketch>` (unchanged
+/// since sylph 0.9.0); `.syl2db` is sylph 1.0.0's two-stage seekable layout.
 ///
 /// # Safety
 /// `path` must be a valid pointer to a NUL-terminated C string.
@@ -134,13 +146,45 @@ pub unsafe extern "C" fn sylph_database_load(path: *const c_char) -> *mut SylphD
             }
         };
 
-        let file = match File::open(path_str) {
+        let mut file = match File::open(path_str) {
             Ok(f) => f,
             Err(e) => {
                 set_error_fmt!("sylph_database_load: failed to open '{}': {}", path_str, e);
                 return ptr::null_mut();
             }
         };
+
+        // Two-stage databases start with the "SY2D" magic; sniff it so callers
+        // never have to care which kind of file they were handed.
+        let mut magic = [0u8; 4];
+        let is_two_stage = matches!(file.read_exact(&mut magic), Ok(()) if &magic == b"SY2D");
+        if is_two_stage {
+            drop(file);
+            let db = match twostage_db::open_file(path_str) {
+                Ok(db) => db,
+                Err(e) => {
+                    set_error_fmt!(
+                        "sylph_database_load: '{}' is not a valid .syl2db: {}",
+                        path_str,
+                        e
+                    );
+                    return ptr::null_mut();
+                }
+            };
+            if db.is_empty() {
+                set_error_fmt!("sylph_database_load: '{}' contains zero genomes", path_str);
+                return ptr::null_mut();
+            }
+            return Box::into_raw(Box::new(SylphDatabase {
+                inner: DbInner::TwoStage(db),
+            }));
+        }
+
+        // Plain .syldb: rewind past the sniffed bytes and bincode-decode.
+        if let Err(e) = std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0)) {
+            set_error_fmt!("sylph_database_load: failed to read '{}': {}", path_str, e);
+            return ptr::null_mut();
+        }
         let reader = BufReader::with_capacity(10_000_000, file);
         let genomes: Vec<GenomeSketch> = match bincode::deserialize_from(reader) {
             Ok(g) => g,
@@ -158,7 +202,9 @@ pub unsafe extern "C" fn sylph_database_load(path: *const c_char) -> *mut SylphD
             set_error_fmt!("sylph_database_load: '{}' contains zero genomes", path_str);
             return ptr::null_mut();
         }
-        Box::into_raw(Box::new(SylphDatabase { genomes }))
+        Box::into_raw(Box::new(SylphDatabase {
+            inner: DbInner::Plain(genomes),
+        }))
     })
 }
 
@@ -188,7 +234,27 @@ pub unsafe extern "C" fn sylph_database_num_genomes(db: *const SylphDatabase) ->
     if db.is_null() {
         return 0;
     }
-    guarded(0, || (*db).genomes.len())
+    guarded(0, || match &(*db).inner {
+        DbInner::Plain(g) => g.len(),
+        DbInner::TwoStage(t) => t.len(),
+    })
+}
+
+/// 1 if the database is a two-stage `.syl2db`, 0 for a plain `.syldb` (or NULL).
+/// Profiling works identically on both; this is for diagnostics and for hosts
+/// that want to validate what they were given.
+///
+/// # Safety
+/// `db` must be a valid (or NULL) pointer from `sylph_database_load`.
+#[no_mangle]
+pub unsafe extern "C" fn sylph_database_is_two_stage(db: *const SylphDatabase) -> i32 {
+    if db.is_null() {
+        return 0;
+    }
+    guarded(0, || match &(*db).inner {
+        DbInner::Plain(_) => 0,
+        DbInner::TwoStage(_) => 1,
+    })
 }
 
 // ============================================================================
@@ -754,6 +820,155 @@ pub unsafe extern "C" fn sylph_index_builder_write(
     })
 }
 
+/// Two-stage (`.syl2db`) write parameters. Mirrors `sylph convert-db-two-screen`.
+/// Layout-stable; pass 0 for "use sylph's default".
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SylphTwoStageParams {
+    /// Stage-1 screen subsampling rate (`--screen-c`). Must be >= the dense c.
+    /// 0 = default (3000).
+    pub screen_c: u32,
+    /// Minimum sparse k-mers per genome before the screen is densified for it
+    /// (`--min-sparse-kmers`). 0 = default (50).
+    pub min_sparse_kmers: u32,
+    /// `--min-contain` recorded in the database. 0 = default (7).
+    pub min_contain: u32,
+    pub _reserved0: u32,
+    pub _reserved1: u64,
+}
+
+impl Default for SylphTwoStageParams {
+    fn default() -> Self {
+        SylphTwoStageParams {
+            screen_c: crate::constants::SCREEN_C_DEFAULT as u32,
+            min_sparse_kmers: crate::constants::SPARSE_TARGET_MIN_DEFAULT as u32,
+            min_contain: crate::profile_api::ProfileArgs::default().min_contain as u32,
+            _reserved0: 0,
+            _reserved1: 0,
+        }
+    }
+}
+
+/// Populate `out` with sylph's two-stage conversion defaults. Returns 0 on
+/// success, non-zero on a NULL `out`.
+#[no_mangle]
+pub unsafe extern "C" fn sylph_two_stage_params_default(out: *mut SylphTwoStageParams) -> i32 {
+    if out.is_null() {
+        return 1;
+    }
+    *out = SylphTwoStageParams::default();
+    0
+}
+
+/// Serialize all completed genomes as a two-stage `.syl2db` (what
+/// `sylph convert-db-two-screen` produces from a `.syldb`). Same preconditions
+/// as `sylph_index_builder_write`, plus the converter's own checks: every
+/// genome must carry profiling k-mers (pseudotax = 1 at sketch time) and the
+/// screen rate must not be denser than the dense rate. Validation happens
+/// before the output path is touched. `params` may be NULL (defaults).
+/// Returns 0 on success, non-zero on error.
+///
+/// # Safety
+/// `builder` must be a live SylphIndexBuilder. `path` must be a NUL-terminated
+/// C string. `params` is borrowed for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn sylph_index_builder_write_two_stage(
+    builder: *mut SylphIndexBuilder,
+    path: *const c_char,
+    params: *const SylphTwoStageParams,
+) -> i32 {
+    guarded(-1, || {
+        if builder.is_null() {
+            set_error("sylph_index_builder_write_two_stage: builder is NULL");
+            return -1;
+        }
+        if path.is_null() {
+            set_error("sylph_index_builder_write_two_stage: path is NULL");
+            return -1;
+        }
+        let b = &*builder;
+        if !b.open.is_empty() {
+            set_error(
+                "sylph_index_builder_write_two_stage: a genome is still open; call end_genome first",
+            );
+            return -1;
+        }
+        if b.genomes.is_empty() {
+            set_error("sylph_index_builder_write_two_stage: no genomes added");
+            return -1;
+        }
+        let defaults = SylphTwoStageParams::default();
+        let p = if params.is_null() { defaults } else { *params };
+        let screen_c = if p.screen_c == 0 {
+            defaults.screen_c
+        } else {
+            p.screen_c
+        } as usize;
+        let min_sparse_kmers = if p.min_sparse_kmers == 0 {
+            defaults.min_sparse_kmers
+        } else {
+            p.min_sparse_kmers
+        } as usize;
+        let min_contain = if p.min_contain == 0 {
+            defaults.min_contain
+        } else {
+            p.min_contain
+        } as usize;
+
+        let c = b.genomes[0].c;
+        if screen_c < c {
+            set_error_fmt!(
+                "sylph_index_builder_write_two_stage: screen_c ({}) must be >= the database c ({}); \
+                 the stage-1 screen can only be sparser than the dense sketch",
+                screen_c,
+                c
+            );
+            return -1;
+        }
+        if b.genomes
+            .iter()
+            .any(|g| g.pseudotax_tracked_nonused_kmers.is_none())
+        {
+            set_error(
+                "sylph_index_builder_write_two_stage: some genomes were sketched with pseudotax = 0 \
+                 (no profiling k-mers); a two-stage database always needs them",
+            );
+            return -1;
+        }
+        let path_str = match CStr::from_ptr(path).to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                set_error("sylph_index_builder_write_two_stage: path is not valid UTF-8");
+                return -1;
+            }
+        };
+        let file = match File::create(path_str) {
+            Ok(f) => f,
+            Err(e) => {
+                set_error_fmt!(
+                    "sylph_index_builder_write_two_stage: failed to create '{}': {}",
+                    path_str,
+                    e
+                );
+                return -1;
+            }
+        };
+        match twostage_db::write_two_stage_db(
+            BufWriter::new(file),
+            &b.genomes,
+            screen_c,
+            min_sparse_kmers,
+            min_contain,
+        ) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_error_fmt!("sylph_index_builder_write_two_stage: {}", e);
+                -1
+            }
+        }
+    })
+}
+
 /// Move all completed genomes from `src` into `dst` (`src` ends empty). For
 /// combining per-thread builders before a single write: sketch genomes into K
 /// independent builders across K threads, then merge them into one and write.
@@ -836,7 +1051,9 @@ pub struct SylphProfileParams {
     /// Minimum contained k-mers for a hit (sylph >= 1.0 `--min-contain`).
     /// 0 = sylph default.
     pub min_contain: u32,
-    pub _reserved1: u64,
+    /// Two-stage databases only: stage-1 screen minimum adjusted ANI in percent
+    /// (`--screen-ani`). <= 0 = sylph default (85). Ignored for `.syldb`.
+    pub screen_ani: f64,
 }
 
 impl Default for SylphProfileParams {
@@ -859,7 +1076,7 @@ impl Default for SylphProfileParams {
             redundant_ani: d.redundant_ani,
             num_threads: 0,
             min_contain: d.min_contain as u32,
-            _reserved1: 0,
+            screen_ani: 0.0,
         }
     }
 }
@@ -902,6 +1119,11 @@ impl SylphProfileParams {
             },
             redundant_ani: self.redundant_ani,
             log_reassignments: self.log_reassignments != 0,
+            screen_ani: if self.screen_ani <= 0.0 {
+                None
+            } else {
+                Some(self.screen_ani)
+            },
             num_threads: self.num_threads as usize,
         }
     }
@@ -1004,7 +1226,14 @@ pub unsafe extern "C" fn sylph_profile(
         } else {
             (*params).to_profile_args()
         };
-        let results = crate::profile_api::run_profile_compute(&(*db).genomes, sample_ref, &pa);
+        let results = match &(*db).inner {
+            DbInner::Plain(genomes) => {
+                crate::profile_api::run_profile_compute(genomes, sample_ref, &pa)
+            }
+            DbInner::TwoStage(two) => {
+                crate::profile_api::run_profile_compute_two_stage(two, sample_ref, &pa)
+            }
+        };
         match owned_results_to_ffi(&results, out_array, out_schema) {
             Ok(()) => 0,
             Err(msg) => {
@@ -1503,6 +1732,149 @@ mod tests {
         unsafe {
             sylph_index_builder_free(ptr::null_mut());
             assert_eq!(sylph_index_builder_num_genomes(ptr::null()), 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod two_stage_tests {
+    use super::*;
+    use std::ffi::CString;
+
+    fn contig(seed: u64, len: usize) -> Vec<u8> {
+        let bases = [b'A', b'C', b'G', b'T'];
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                bases[((state >> 33) & 0b11) as usize]
+            })
+            .collect()
+    }
+
+    unsafe fn builder_with_two_genomes(pseudotax: u8) -> *mut SylphIndexBuilder {
+        let params = SylphGenomeSketchParams {
+            pseudotax,
+            ..SylphGenomeSketchParams::default()
+        };
+        let b = sylph_index_builder_create(&params);
+        assert!(!b.is_null());
+        for (i, name) in ["genome-A", "genome-B"].iter().enumerate() {
+            let n = CString::new(*name).unwrap();
+            let s = contig(0x9E3779B97F4A7C15 + i as u64, 20_000);
+            assert_eq!(
+                sylph_index_builder_add_contig(b, n.as_ptr(), 0, n.as_ptr(), s.as_ptr(), s.len()),
+                0
+            );
+            assert_eq!(sylph_index_builder_end_genome(b, n.as_ptr()), 0);
+        }
+        b
+    }
+
+    fn last_error() -> String {
+        unsafe {
+            CStr::from_ptr(sylph_get_last_error())
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+
+    /// A `.syl2db` written by the index builder loads through the same
+    /// `sylph_database_load` as a `.syldb`, and the handle reports which
+    /// kind it is (hosts route diagnostics / expectations on it).
+    #[test]
+    fn two_stage_write_load_and_flag() {
+        unsafe {
+            let b = builder_with_two_genomes(1);
+            let dir = std::env::temp_dir();
+            let plain = dir.join(format!("sylph_ffi_two_stage_{}.syldb", std::process::id()));
+            let two = dir.join(format!("sylph_ffi_two_stage_{}.syl2db", std::process::id()));
+            let plain_c = CString::new(plain.to_str().unwrap()).unwrap();
+            let two_c = CString::new(two.to_str().unwrap()).unwrap();
+
+            assert_eq!(
+                sylph_index_builder_write(b, plain_c.as_ptr()),
+                0,
+                "{}",
+                last_error()
+            );
+            let mut tp = SylphTwoStageParams::default();
+            assert_eq!(sylph_two_stage_params_default(&mut tp), 0);
+            assert!(
+                tp.screen_c >= 200,
+                "default screen_c must be sparser than dense c"
+            );
+            assert!(tp.min_sparse_kmers >= 1);
+            assert_eq!(
+                sylph_index_builder_write_two_stage(b, two_c.as_ptr(), &tp),
+                0,
+                "{}",
+                last_error()
+            );
+            sylph_index_builder_free(b);
+
+            let db_plain = sylph_database_load(plain_c.as_ptr());
+            assert!(!db_plain.is_null(), "{}", last_error());
+            assert_eq!(sylph_database_is_two_stage(db_plain), 0);
+            assert_eq!(sylph_database_num_genomes(db_plain), 2);
+
+            let db_two = sylph_database_load(two_c.as_ptr());
+            assert!(!db_two.is_null(), "{}", last_error());
+            assert_eq!(sylph_database_is_two_stage(db_two), 1);
+            assert_eq!(sylph_database_num_genomes(db_two), 2);
+
+            assert_eq!(sylph_database_is_two_stage(ptr::null()), 0);
+
+            sylph_database_free(db_plain);
+            sylph_database_free(db_two);
+            let _ = std::fs::remove_file(&plain);
+            let _ = std::fs::remove_file(&two);
+        }
+    }
+
+    /// The stage-1 screen can only be sparser than the dense sketch; the CLI
+    /// refuses `--screen-c` below `-c`, and so must the FFI (before touching
+    /// the output path).
+    #[test]
+    fn two_stage_write_rejects_screen_c_below_c() {
+        unsafe {
+            let b = builder_with_two_genomes(1);
+            let path = std::env::temp_dir().join("sylph_ffi_two_stage_bad_screen.syl2db");
+            let path_c = CString::new(path.to_str().unwrap()).unwrap();
+            let tp = SylphTwoStageParams {
+                screen_c: 100,
+                ..SylphTwoStageParams::default()
+            };
+            assert_eq!(
+                sylph_index_builder_write_two_stage(b, path_c.as_ptr(), &tp),
+                -1
+            );
+            assert!(last_error().contains("screen_c"), "got: {}", last_error());
+            assert!(
+                !path.exists(),
+                "no output must be created on validation failure"
+            );
+            sylph_index_builder_free(b);
+        }
+    }
+
+    /// Genomes sketched with pseudotax=0 (query-only) have no profiling k-mers;
+    /// a two-stage database always needs them, exactly like the CLI converter.
+    #[test]
+    fn two_stage_write_rejects_query_only_genomes() {
+        unsafe {
+            let b = builder_with_two_genomes(0);
+            let path = std::env::temp_dir().join("sylph_ffi_two_stage_query_only.syl2db");
+            let path_c = CString::new(path.to_str().unwrap()).unwrap();
+            let tp = SylphTwoStageParams::default();
+            assert_eq!(
+                sylph_index_builder_write_two_stage(b, path_c.as_ptr(), &tp),
+                -1
+            );
+            assert!(last_error().contains("pseudotax"), "got: {}", last_error());
+            sylph_index_builder_free(b);
         }
     }
 }

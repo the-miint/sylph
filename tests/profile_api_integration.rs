@@ -129,3 +129,55 @@ fn run_profile_compute_query_mode_keeps_all_genomes() {
     assert!(results[0].taxonomic_abundance.is_none());
     assert!(results[0].sequence_abundance.is_none());
 }
+
+/// The two-stage path (stage-1 screen, dense decode of survivors, then the
+/// same kernels) must report exactly what the plain path reports for the
+/// same genomes: the screen is a pure optimisation, not a different model.
+#[test]
+fn run_profile_compute_two_stage_matches_plain() {
+    use sylph::profile_api::run_profile_compute_two_stage;
+    use sylph::twostage_db::{open_file, write_two_stage_db};
+
+    let genomes = sketch_refs();
+    let sample = sketch_pair_sequences(
+        "test_files/k12_R1.fq",
+        "test_files/k12_R2.fq",
+        C,
+        K,
+        None,
+        false,
+        0.0,
+    )
+    .expect("paired-end sketch");
+
+    let path = std::env::temp_dir().join(format!(
+        "sylph_profile_api_two_stage_{}.syl2db",
+        std::process::id()
+    ));
+    {
+        let w = std::io::BufWriter::new(std::fs::File::create(&path).expect("create"));
+        write_two_stage_db(w, &genomes, 3000, 50, 7).expect("write two-stage db");
+    }
+    let db = open_file(path.to_str().unwrap()).expect("open two-stage db");
+    assert_eq!(db.len(), 3);
+
+    let args = ProfileArgs::default();
+    let plain = run_profile_compute(&genomes, &sample, &args);
+    let two_stage = run_profile_compute_two_stage(&db, &sample, &args);
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(plain.len(), 1, "plain path must report K12 only");
+    assert_eq!(two_stage.len(), plain.len());
+    for (p, t) in plain.iter().zip(two_stage.iter()) {
+        assert_eq!(p.genome_name, t.genome_name);
+        assert_eq!(p.contig_name, t.contig_name);
+        assert_eq!(
+            p.adjusted_ani, t.adjusted_ani,
+            "adjusted_ani must be identical"
+        );
+        assert_eq!(p.naive_ani, t.naive_ani);
+        assert_eq!(p.eff_cov, t.eff_cov);
+        assert_eq!(p.taxonomic_abundance, t.taxonomic_abundance);
+        assert_eq!(p.sequence_abundance, t.sequence_abundance);
+    }
+}

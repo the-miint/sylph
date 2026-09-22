@@ -61,12 +61,15 @@ const char *sylph_get_last_error(void);
 /* Opaque handle to a loaded sylph database. */
 typedef struct SylphDatabase SylphDatabase;
 
-/* Load a .syldb (bincode-serialized Vec<GenomeSketch>) from disk.
- * Returns NULL on error; call sylph_get_last_error() for details.
- *
- * The on-disk format is the sylph .syldb (unchanged from 0.9.0 through 1.0.0). Loading an older or future
- * format returns NULL with a "not a valid .syldb" error. */
+/* Load a reference database from disk: either a plain .syldb (bincode-
+ * serialized Vec<GenomeSketch>, unchanged from sylph 0.9.0 through 1.0.0) or a
+ * two-stage .syl2db (sylph 1.0.0). The format is detected from the file's magic
+ * bytes, not its name. Returns NULL on error; call sylph_get_last_error(). */
 SylphDatabase *sylph_database_load(const char *path);
+
+/* 1 if db is a two-stage .syl2db, 0 for a plain .syldb (or NULL). Profiling
+ * works identically on both. */
+int sylph_database_is_two_stage(const SylphDatabase *db);
 
 /* Free a database. Safe to call with NULL. Must NOT be called while any
  * sylph_profile() invocations against this database are still running. */
@@ -197,6 +200,34 @@ int sylph_index_builder_merge(SylphIndexBuilder *dst, SylphIndexBuilder *src);
  * failure. Returns 0 on success, non-zero on error. */
 int sylph_index_builder_write(SylphIndexBuilder *builder, const char *path);
 
+/* Two-stage (.syl2db) write parameters, mirroring `sylph convert-db-two-screen`.
+ * Layout-stable; pass 0 for "use sylph's default". */
+typedef struct {
+    /* Stage-1 screen subsampling rate (--screen-c). Must be >= the dense c.
+     * 0 = default 3000. */
+    uint32_t screen_c;
+    /* Minimum sparse k-mers per genome before its screen is densified
+     * (--min-sparse-kmers). 0 = default 50. */
+    uint32_t min_sparse_kmers;
+    /* --min-contain recorded in the database. 0 = default 7. */
+    uint32_t min_contain;
+    uint32_t _reserved0;
+    uint64_t _reserved1;
+} SylphTwoStageParams;
+
+/* Populate `out` with sylph's two-stage conversion defaults. Returns 0 on
+ * success, non-zero if `out` is NULL. */
+int sylph_two_stage_params_default(SylphTwoStageParams *out);
+
+/* Serialize all completed genomes as a two-stage .syl2db (what
+ * `sylph convert-db-two-screen` produces from a .syldb). Same preconditions as
+ * sylph_index_builder_write, plus: every genome must have been sketched with
+ * pseudotax = 1, and screen_c must be >= the dense c. Validation happens before
+ * the output path is touched. params may be NULL (defaults). Returns 0 on
+ * success, non-zero on error. */
+int sylph_index_builder_write_two_stage(SylphIndexBuilder *builder, const char *path,
+                                        const SylphTwoStageParams *params);
+
 /* Free an index builder. Safe to call with NULL. */
 void sylph_index_builder_free(SylphIndexBuilder *builder);
 
@@ -253,7 +284,10 @@ typedef struct {
     /* Minimum contained k-mers for a genome to count as a hit (sylph >= 1.0
      * `--min-contain`). 0 = use sylph's default (7). */
     uint32_t min_contain;
-    uint64_t _reserved1;
+    /* Two-stage (.syl2db) databases only: minimum adjusted ANI in percent for a
+     * genome to pass the stage-1 screen (--screen-ani). <= 0 = sylph's default
+     * (85). Ignored for plain .syldb databases. */
+    double   screen_ani;
 } SylphProfileParams;
 
 /* Populate `out` with sylph's default profile parameters. C/C++ callers

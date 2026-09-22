@@ -130,7 +130,7 @@ fn minimum_ani_fraction(args: &ContainArgs) -> f64 {
 /// *dense* sketches for only the genomes that pass. The returned set is one
 /// database's contribution to the combined active-genome list the (expensive)
 /// dense profiling pass runs against.
-fn compute_dense_survivors(
+pub(crate) fn compute_dense_survivors(
     args: &ContainArgs,
     db: &TwoStageDb,
     sequence_sketch: &SequencesSketch,
