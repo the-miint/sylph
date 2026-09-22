@@ -17,14 +17,19 @@
 //! - [`GenomeSketchBuilder`] builds a reference `GenomeSketch` from contigs
 //!   (backs `sylph_index_create`).
 
+use crate::constants::DEFAULT_RNG_SEED;
 use crate::sketch::{
     dup_removal_lsh_full, dup_removal_lsh_full_exact, extract_markers, extract_markers_positions,
-    pair_kmer, pair_kmer_single, Marker,
+    pair_kmer, pair_kmer_single,
 };
 use crate::types::{GenomeSketch, MMHashSet, SequencesSketch};
 
 use fxhash::{FxHashSet, FxHasher};
+use rand::{rngs::SmallRng, SeedableRng};
 use scalable_cuckoo_filter::{ScalableCuckooFilter, ScalableCuckooFilterBuilder};
+
+/// Same as the private `sketch::Marker` alias (the LSH pair-signature word).
+type Marker = u32;
 
 // ============================================================================
 // Reference-genome sketch builder (produces a GenomeSketch → .syldb entry)
@@ -78,7 +83,13 @@ impl GenomeSketchBuilder {
             self.first_contig_name = Some(contig_name.replace('\t', " "));
         }
         self.gn_size += seq.len();
-        extract_markers_positions(seq, &mut self.kmer_positions, self.c, self.k, self.contig_number);
+        extract_markers_positions(
+            seq,
+            &mut self.kmer_positions,
+            self.c,
+            self.k,
+            self.contig_number,
+        );
         self.contig_number += 1;
     }
 
@@ -145,7 +156,7 @@ pub struct SketchPairBuilder {
     no_dedup: bool,
     dedup_fpr: f64,
     kmer_pair_set_exact: FxHashSet<(u64, [Marker; 2])>,
-    kmer_pair_set_approx: ScalableCuckooFilter<(u64, [Marker; 2]), FxHasher>,
+    kmer_pair_set_approx: ScalableCuckooFilter<(u64, [Marker; 2]), FxHasher, SmallRng>,
     num_dup_removed: usize,
     mean_read_length: f64,
     counter: f64,
@@ -173,6 +184,9 @@ impl SketchPairBuilder {
             .initial_capacity(1_000_000_0)
             .false_positive_probability(fpr)
             .hasher(FxHasher::default())
+            // Seeded like upstream `sketch_pair_sequences` so the approximate
+            // dedup filter is deterministic run to run.
+            .rng(SmallRng::seed_from_u64(DEFAULT_RNG_SEED))
             .finish();
         SketchPairBuilder {
             sketch,
@@ -360,7 +374,8 @@ mod tests {
             .map(|(r1, r2)| (r1.as_slice(), Some(r2.as_slice())))
             .collect();
 
-        let slice_sketch = sketch_pair_slices(pairs, r1_path.to_string(), None, 200, 31, false, 0.0);
+        let slice_sketch =
+            sketch_pair_slices(pairs, r1_path.to_string(), None, 200, 31, false, 0.0);
 
         assert_eq!(
             path_sketch.kmer_counts, slice_sketch.kmer_counts,
@@ -387,7 +402,10 @@ mod tests {
             r1_seqs.iter().map(|r1| (r1.as_slice(), None)).collect();
 
         let sketch = sketch_pair_slices(pairs, r1_path.to_string(), None, 200, 31, false, 0.0);
-        assert!(!sketch.paired, "single-end builder must report paired=false");
+        assert!(
+            !sketch.paired,
+            "single-end builder must report paired=false"
+        );
         assert!(!sketch.kmer_counts.is_empty(), "expected non-empty sketch");
     }
 
@@ -477,7 +495,10 @@ mod tests {
         // one test cover k/c/min_spacing parity by pointing at CLI dbs built
         // with different flags.
         let envn = |k: &str, d: usize| -> usize {
-            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
         };
         let (c, k, min_spacing) = (
             envn("MIINT_SYLPH_C", 200),
@@ -514,7 +535,8 @@ mod tests {
         assert_eq!(cli.len(), mine.len(), "genome count differs from CLI");
         for (c, m) in cli.iter().zip(mine.iter()) {
             assert_eq!(
-                c, m,
+                c,
+                m,
                 "GenomeSketch differs from CLI for {} (kmers {} vs {}, gn_size {} vs {}, \
                  first_contig {:?} vs {:?})",
                 c.file_name,

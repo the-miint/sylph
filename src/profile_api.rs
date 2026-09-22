@@ -1,7 +1,7 @@
 //! Pure data-in / data-out profile entry point.
 //!
 //! `run_profile_compute` is the testable seam between the CLI orchestrator
-//! (`contain::contain`) and the upcoming C/Arrow FFI: it takes already-loaded
+//! (`contain::contain`) and the C/Arrow FFI (`c_api.rs`): it takes already-loaded
 //! reference genomes and a sample sketch, runs the full sylph profiling
 //! pipeline (containment-ANI estimation, optional pseudotax winner-take-all
 //! reassignment, abundance computation), and returns owned, lifetime-free
@@ -11,11 +11,13 @@
 //! `bootstrap_interval`, `winner_table`, etc.) — this module only owns the
 //! orchestration loop and the `ProfileArgs` / `OwnedAniResult` shapes.
 
+use crate::cmdline::ContainArgs;
 use crate::contain::{
     derep_if_reassign_threshold, estimate_covered_bases, estimate_true_cov, get_kmer_identity,
     get_stats, winner_table,
 };
 use crate::types::{AdjustStatus, AniResult, GenomeSketch, SequencesSketch};
+use clap::Parser;
 use rayon::prelude::*;
 use std::sync::Mutex;
 
@@ -35,18 +37,25 @@ impl Default for LambdaEstimator {
     }
 }
 
-/// User-facing profile parameters. Mirrors the fields of `ContainArgs` that
-/// affect compute, with sensible defaults matching `sylph profile --reads`.
+/// User-facing profile parameters: the subset of `ContainArgs` (cmdline.rs)
+/// that affects compute, with defaults matching `sylph profile`.
 ///
 /// `pseudotax = true` is the "profile" mode (winner-take-all reassignment +
 /// taxonomic/sequence abundance). Setting it to `false` produces "query"-mode
 /// results (containment ANI only, no abundances). The duckdb-miint table
 /// function always sets `pseudotax = true`.
+///
+/// The compute kernels in `contain.rs` take a `ContainArgs`; `to_contain_args`
+/// builds one by running these values through sylph's own clap definitions,
+/// so every other `ContainArgs` field carries exactly the CLI default and new
+/// upstream knobs need no mirroring here unless we want to expose them.
 #[derive(Debug, Clone)]
 pub struct ProfileArgs {
     pub estimator: LambdaEstimator,
     pub min_count_correct: f64,
     pub min_number_kmers: f64,
+    /// Minimum contained k-mers for a genome to count as a hit (`--min-contain`).
+    pub min_contain: usize,
     /// Minimum adjusted ANI cutoff in percent (0..100). `None` uses the
     /// internal default (90% in query mode, 95% in profile mode).
     pub minimum_ani: Option<f64>,
@@ -66,14 +75,24 @@ pub struct ProfileArgs {
     pub num_threads: usize,
 }
 
+/// clap wrapper so `ContainArgs` (an `Args` struct) can be parsed on its own.
+#[derive(Parser)]
+#[clap(name = "sylph")]
+struct ContainArgsCli {
+    #[clap(flatten)]
+    args: ContainArgs,
+}
+
 impl Default for ProfileArgs {
     fn default() -> Self {
-        // Defaults match sylph 0.9.0's `--reads` profile mode. Verified
-        // against `cmdline.rs`'s `ContainArgs` derive defaults.
+        // Numeric defaults are read from the clap definitions in cmdline.rs —
+        // the same source of truth `sylph profile` uses.
+        let d = ContainArgsCli::parse_from(["sylph"]).args;
         ProfileArgs {
             estimator: LambdaEstimator::Ratio,
-            min_count_correct: 3.0,
-            min_number_kmers: 50.0,
+            min_count_correct: d.min_count_correct,
+            min_number_kmers: d.min_number_kmers,
+            min_contain: d.min_contain,
             minimum_ani: None,
             pseudotax: true,
             estimate_unknown: false,
@@ -82,10 +101,68 @@ impl Default for ProfileArgs {
             no_adj: false,
             mean_coverage: false,
             seq_id: None,
-            redundant_ani: crate::constants::DEREP_PROFILE_ANI,
+            redundant_ani: d.redundant_ani,
             log_reassignments: false,
             num_threads: 0,
         }
+    }
+}
+
+impl ProfileArgs {
+    /// Materialise the `ContainArgs` the `contain.rs` kernels expect, applying
+    /// the same normalisation `contain::contain` does (`--estimate-read-counts`
+    /// implies `-u`).
+    pub fn to_contain_args(&self) -> ContainArgs {
+        let mut argv: Vec<String> = vec!["sylph".to_string()];
+        let mut flag = |f: &str| argv.push(f.to_string());
+        flag(match self.estimator {
+            LambdaEstimator::Ratio => "--ratio",
+            LambdaEstimator::Mme => "--mme",
+            LambdaEstimator::Nb => "--nb",
+            LambdaEstimator::Mle => "--mle",
+        });
+        if self.pseudotax {
+            flag("--pseudotax");
+        }
+        if self.estimate_unknown {
+            flag("--estimate-unknown");
+        }
+        if self.estimate_read_counts {
+            flag("--estimate-read-counts");
+        }
+        if self.no_ci {
+            flag("--no-ci");
+        }
+        if self.no_adj {
+            flag("--no-adjust");
+        }
+        if self.mean_coverage {
+            flag("--mean-coverage");
+        }
+        if self.log_reassignments {
+            flag("--log-reassignments");
+        }
+        let mut opt = |f: &str, v: String| {
+            argv.push(f.to_string());
+            argv.push(v);
+        };
+        opt("--min-count-correct", self.min_count_correct.to_string());
+        opt("--min-number-kmers", self.min_number_kmers.to_string());
+        opt("--min-contain", self.min_contain.to_string());
+        opt("--redundancy-threshold", self.redundant_ani.to_string());
+        if let Some(a) = self.minimum_ani {
+            opt("--minimum-ani", a.to_string());
+        }
+        if let Some(id) = self.seq_id {
+            opt("--read-seq-id", id.to_string());
+        }
+        let mut args = ContainArgsCli::try_parse_from(&argv)
+            .unwrap_or_else(|e| panic!("ProfileArgs -> ContainArgs: {e} (argv {argv:?})"))
+            .args;
+        if args.estimate_read_counts {
+            args.estimate_unknown = true;
+        }
+        args
     }
 }
 
@@ -198,6 +275,11 @@ fn run_profile_compute_inner(
     sample: &SequencesSketch,
     args: &ProfileArgs,
 ) -> Vec<OwnedAniResult> {
+    // The kernels below take sylph's own ContainArgs; from here on `args`
+    // is that (field names coincide with ProfileArgs for everything used).
+    let contain_args = args.to_contain_args();
+    let args = &contain_args;
+
     // Estimated sequence identity used by estimate_true_cov.
     let kmer_id_opt = match args.seq_id {
         Some(pct) => Some((pct / 100.0).powf(sample.k as f64)),
@@ -225,7 +307,8 @@ fn run_profile_compute_inner(
         let remaining: Vec<&GenomeSketch> = stats.iter().map(|s| s.genome_sketch).collect();
         let stats_pass2: Mutex<Vec<AniResult>> = Mutex::new(Vec::new());
         remaining.into_par_iter().for_each(|gs| {
-            if let Some(res) = get_stats(args, gs, sample, Some(&winner_map), args.log_reassignments)
+            if let Some(res) =
+                get_stats(args, gs, sample, Some(&winner_map), args.log_reassignments)
             {
                 stats_pass2.lock().unwrap().push(res);
             }
@@ -265,14 +348,14 @@ fn run_profile_compute_inner(
         for s in stats.iter_mut() {
             if args.estimate_read_counts {
                 s.seq_abund = Some(
-                    (s.final_est_cov * s.genome_sketch.gn_size as f64
-                        / sample.mean_read_length
+                    (s.final_est_cov * s.genome_sketch.gn_size as f64 / sample.mean_read_length
                         * bases_explained)
                         .round(),
                 );
             } else if total_seq_cov > 0.0 {
                 s.seq_abund = Some(
-                    s.final_est_cov * s.genome_sketch.gn_size as f64 / total_seq_cov * 100.0
+                    s.final_est_cov * s.genome_sketch.gn_size as f64 / total_seq_cov
+                        * 100.0
                         * bases_explained,
                 );
             } else {

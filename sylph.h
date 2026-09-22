@@ -43,7 +43,7 @@ extern "C" {
 /* Upstream sylph crate version baked into this library. */
 const char *sylph_version(void);
 
-/* Fork tag (e.g. "v0.9.0-miint"). Useful for source_hash debugging. */
+/* Fork tag (e.g. "v1.0.0-miint"). Useful for source_hash debugging. */
 const char *sylph_miint_fork_version(void);
 
 /* ============================================================================
@@ -64,7 +64,7 @@ typedef struct SylphDatabase SylphDatabase;
 /* Load a .syldb (bincode-serialized Vec<GenomeSketch>) from disk.
  * Returns NULL on error; call sylph_get_last_error() for details.
  *
- * The on-disk format is sylph 0.9.0 .syldb. Loading an older or future
+ * The on-disk format is the sylph .syldb (unchanged from 0.9.0 through 1.0.0). Loading an older or future
  * format returns NULL with a "not a valid .syldb" error. */
 SylphDatabase *sylph_database_load(const char *path);
 
@@ -250,7 +250,9 @@ typedef struct {
     double   seq_id;
     double   redundant_ani;
     uint32_t num_threads;
-    uint32_t _reserved0;
+    /* Minimum contained k-mers for a genome to count as a hit (sylph >= 1.0
+     * `--min-contain`). 0 = use sylph's default (7). */
+    uint32_t min_contain;
     uint64_t _reserved1;
 } SylphProfileParams;
 

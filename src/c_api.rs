@@ -40,7 +40,10 @@ fn set_error<S: Into<Vec<u8>>>(msg: S) {
     // Replace any interior NULs to keep CString::new from failing on user
     // data (e.g. file paths with embedded NULs, which shouldn't happen but
     // we don't want to panic on either).
-    let cleaned: Vec<u8> = bytes.into_iter().map(|b| if b == 0 { b'?' } else { b }).collect();
+    let cleaned: Vec<u8> = bytes
+        .into_iter()
+        .map(|b| if b == 0 { b'?' } else { b })
+        .collect();
     let cstr = CString::new(cleaned).unwrap_or_else(|_| CString::new("error").unwrap());
     LAST_ERROR.with(|cell| *cell.borrow_mut() = Some(cstr));
 }
@@ -112,7 +115,7 @@ pub struct SylphDatabase {
 /// Load a `.syldb` from disk.
 ///
 /// Returns NULL on error; call `sylph_get_last_error()` for details.
-/// The file format is bincode-serialized `Vec<GenomeSketch>` (sylph 0.9.0).
+/// The file format is bincode-serialized `Vec<GenomeSketch>` (unchanged since sylph 0.9.0).
 ///
 /// # Safety
 /// `path` must be a valid pointer to a NUL-terminated C string.
@@ -235,16 +238,10 @@ impl SylphSketchParams {
         let k = if self.k == 0 { db_k } else { self.k as usize };
         let c = if self.c == 0 { db_c } else { self.c as usize };
         if k != db_k {
-            return Err(format!(
-                "sketch k ({}) must match database k ({})",
-                k, db_k
-            ));
+            return Err(format!("sketch k ({}) must match database k ({})", k, db_k));
         }
         if c < db_c {
-            return Err(format!(
-                "sketch c ({}) must be >= database c ({})",
-                c, db_c
-            ));
+            return Err(format!("sketch c ({}) must be >= database c ({})", c, db_c));
         }
         Ok((k, c))
     }
@@ -287,14 +284,8 @@ pub unsafe extern "C" fn sylph_sketch_builder_create(
         let k = if p.k == 0 { 31 } else { p.k as usize };
         let c = if p.c == 0 { 200 } else { p.c as usize };
         let no_dedup = p.dedup == 0;
-        let builder = SketchPairBuilder::new(
-            String::from("<ffi>"),
-            None,
-            c,
-            k,
-            no_dedup,
-            p.dedup_fpr,
-        );
+        let builder =
+            SketchPairBuilder::new(String::from("<ffi>"), None, c, k, no_dedup, p.dedup_fpr);
         Box::into_raw(Box::new(SylphSketch {
             inner: SylphSketchInner::Building(builder),
         }))
@@ -486,7 +477,11 @@ impl SylphGenomeSketchParams {
     fn resolve(&self) -> Result<(usize, usize, usize), String> {
         let k = if self.k == 0 { 31 } else { self.k as usize };
         let c = if self.c == 0 { 200 } else { self.c as usize };
-        let min_spacing = if self.min_spacing == 0 { 30 } else { self.min_spacing as usize };
+        let min_spacing = if self.min_spacing == 0 {
+            30
+        } else {
+            self.min_spacing as usize
+        };
         if k != 21 && k != 31 {
             return Err(format!("k must be 21 or 31 (got {})", k));
         }
@@ -521,7 +516,9 @@ struct OpenGenome {
 /// that a zero-init would silently drop. Returns 0 on success, non-zero on a
 /// NULL `out`.
 #[no_mangle]
-pub unsafe extern "C" fn sylph_genome_sketch_params_default(out: *mut SylphGenomeSketchParams) -> i32 {
+pub unsafe extern "C" fn sylph_genome_sketch_params_default(
+    out: *mut SylphGenomeSketchParams,
+) -> i32 {
     if out.is_null() {
         return 1;
     }
@@ -686,7 +683,9 @@ pub unsafe extern "C" fn sylph_index_builder_end_genome(
 /// # Safety
 /// `builder` must be a valid (or NULL) SylphIndexBuilder pointer.
 #[no_mangle]
-pub unsafe extern "C" fn sylph_index_builder_num_genomes(builder: *const SylphIndexBuilder) -> usize {
+pub unsafe extern "C" fn sylph_index_builder_num_genomes(
+    builder: *const SylphIndexBuilder,
+) -> usize {
     if builder.is_null() {
         return 0;
     }
@@ -734,7 +733,11 @@ pub unsafe extern "C" fn sylph_index_builder_write(
         let file = match File::create(path_str) {
             Ok(f) => f,
             Err(e) => {
-                set_error_fmt!("sylph_index_builder_write: failed to create '{}': {}", path_str, e);
+                set_error_fmt!(
+                    "sylph_index_builder_write: failed to create '{}': {}",
+                    path_str,
+                    e
+                );
                 return -1;
             }
         };
@@ -830,13 +833,16 @@ pub struct SylphProfileParams {
     pub redundant_ani: f64,
     /// Number of rayon threads. 0 = use the global pool.
     pub num_threads: u32,
-    /// Reserved for future expansion; pass 0.
-    pub _reserved0: u32,
+    /// Minimum contained k-mers for a hit (sylph >= 1.0 `--min-contain`).
+    /// 0 = sylph default.
+    pub min_contain: u32,
     pub _reserved1: u64,
 }
 
 impl Default for SylphProfileParams {
     fn default() -> Self {
+        // Numeric defaults come from ProfileArgs (i.e. sylph's clap defaults).
+        let d = crate::profile_api::ProfileArgs::default();
         SylphProfileParams {
             estimator: 0,
             pseudotax: 1,
@@ -846,13 +852,13 @@ impl Default for SylphProfileParams {
             no_adj: 0,
             mean_coverage: 0,
             log_reassignments: 0,
-            min_count_correct: 3.0,
-            min_number_kmers: 50.0,
+            min_count_correct: d.min_count_correct,
+            min_number_kmers: d.min_number_kmers,
             minimum_ani: -1.0,
             seq_id: -1.0,
-            redundant_ani: crate::constants::DEREP_PROFILE_ANI,
+            redundant_ani: d.redundant_ani,
             num_threads: 0,
-            _reserved0: 0,
+            min_contain: d.min_contain as u32,
             _reserved1: 0,
         }
     }
@@ -868,10 +874,16 @@ impl SylphProfileParams {
             3 => LambdaEstimator::Mle,
             _ => LambdaEstimator::Ratio,
         };
+        let defaults = ProfileArgs::default();
         ProfileArgs {
             estimator,
             min_count_correct: self.min_count_correct,
             min_number_kmers: self.min_number_kmers,
+            min_contain: if self.min_contain == 0 {
+                defaults.min_contain
+            } else {
+                self.min_contain as usize
+            },
             minimum_ani: if self.minimum_ani < 0.0 {
                 None
             } else {
@@ -883,7 +895,11 @@ impl SylphProfileParams {
             no_ci: self.no_ci != 0,
             no_adj: self.no_adj != 0,
             mean_coverage: self.mean_coverage != 0,
-            seq_id: if self.seq_id < 0.0 { None } else { Some(self.seq_id) },
+            seq_id: if self.seq_id < 0.0 {
+                None
+            } else {
+                Some(self.seq_id)
+            },
             redundant_ani: self.redundant_ani,
             log_reassignments: self.log_reassignments != 0,
             num_threads: self.num_threads as usize,
@@ -988,11 +1004,7 @@ pub unsafe extern "C" fn sylph_profile(
         } else {
             (*params).to_profile_args()
         };
-        let results = crate::profile_api::run_profile_compute(
-            &(*db).genomes,
-            sample_ref,
-            &pa,
-        );
+        let results = crate::profile_api::run_profile_compute(&(*db).genomes, sample_ref, &pa);
         match owned_results_to_ffi(&results, out_array, out_schema) {
             Ok(()) => 0,
             Err(msg) => {
@@ -1018,20 +1030,19 @@ fn owned_results_to_ffi(
 
     let n = results.len();
 
-    let genome_index =
-        UInt32Array::from_iter_values((0..n).map(|i| i as u32));
-    let genome_name = LargeStringArray::from_iter_values(results.iter().map(|r| r.genome_name.as_str()));
-    let contig_name = LargeStringArray::from_iter_values(results.iter().map(|r| r.contig_name.as_str()));
+    let genome_index = UInt32Array::from_iter_values((0..n).map(|i| i as u32));
+    let genome_name =
+        LargeStringArray::from_iter_values(results.iter().map(|r| r.genome_name.as_str()));
+    let contig_name =
+        LargeStringArray::from_iter_values(results.iter().map(|r| r.contig_name.as_str()));
     let sequence_abundance = Float64Array::from_iter(results.iter().map(|r| r.sequence_abundance));
-    let taxonomic_abundance = Float64Array::from_iter(results.iter().map(|r| r.taxonomic_abundance));
+    let taxonomic_abundance =
+        Float64Array::from_iter(results.iter().map(|r| r.taxonomic_abundance));
     let adjusted_ani = Float64Array::from_iter_values(results.iter().map(|r| r.adjusted_ani));
     let eff_cov = Float64Array::from_iter_values(results.iter().map(|r| r.eff_cov));
     let naive_ani = Float64Array::from_iter_values(results.iter().map(|r| r.naive_ani));
-    let kmers_reassigned = UInt64Array::from_iter(
-        results
-            .iter()
-            .map(|r| r.kmers_lost.map(|x| x as u64)),
-    );
+    let kmers_reassigned =
+        UInt64Array::from_iter(results.iter().map(|r| r.kmers_lost.map(|x| x as u64)));
 
     let columns: Vec<(Arc<Field>, ArrayRef)> = vec![
         (
@@ -1109,7 +1120,11 @@ mod tests {
         unsafe {
             let p = sylph_miint_fork_version();
             let s = CStr::from_ptr(p).to_str().unwrap();
-            assert!(s.contains("miint"), "fork version should mention miint, got {}", s);
+            assert!(
+                s.contains("miint"),
+                "fork version should mention miint, got {}",
+                s
+            );
         }
     }
 
@@ -1121,7 +1136,11 @@ mod tests {
             let err = sylph_get_last_error();
             assert!(!err.is_null());
             let msg = CStr::from_ptr(err).to_str().unwrap();
-            assert!(msg.contains("NULL"), "error message should mention NULL, got {}", msg);
+            assert!(
+                msg.contains("NULL"),
+                "error message should mention NULL, got {}",
+                msg
+            );
         }
     }
 
@@ -1181,8 +1200,10 @@ mod tests {
             assert!(!s.is_null());
 
             // 70bp synthetic read pair (DNA only — passes the seeding alphabet).
-            let r1: &[u8] = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAC";
-            let r2: &[u8] = b"TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATG";
+            let r1: &[u8] =
+                b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAC";
+            let r2: &[u8] =
+                b"TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATG";
             let rc = sylph_sketch_builder_add_pair(s, r1.as_ptr(), r1.len(), r2.as_ptr(), r2.len());
             assert_eq!(rc, 0);
 
@@ -1247,8 +1268,8 @@ mod tests {
         let c = 200usize;
 
         // Reference: path-based sketcher with exact dedup (dedup_fpr = 0.0).
-        let path_sketch = sketch_pair_sequences(r1_path, r2_path, c, k, None, false, 0.0)
-            .expect("path sketcher");
+        let path_sketch =
+            sketch_pair_sequences(r1_path, r2_path, c, k, None, false, 0.0).expect("path sketcher");
 
         // Slurp paired reads into Vec<Vec<u8>> for FFI feeding.
         fn slurp(p: &str) -> Vec<Vec<u8>> {
@@ -1274,13 +1295,8 @@ mod tests {
             let s = sylph_sketch_builder_create(&params);
             assert!(!s.is_null());
             for (r1, r2) in r1s.iter().zip(r2s.iter()) {
-                let rc = sylph_sketch_builder_add_pair(
-                    s,
-                    r1.as_ptr(),
-                    r1.len(),
-                    r2.as_ptr(),
-                    r2.len(),
-                );
+                let rc =
+                    sylph_sketch_builder_add_pair(s, r1.as_ptr(), r1.len(), r2.as_ptr(), r2.len());
                 assert_eq!(rc, 0, "add_pair failed");
             }
             let rc = sylph_sketch_builder_finalize(s);
@@ -1308,7 +1324,9 @@ mod tests {
         let mut state: u64 = 0x9E3779B97F4A7C15;
         let mut out = Vec::with_capacity(len);
         for _ in 0..len {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             out.push(bases[((state >> 33) & 0b11) as usize]);
         }
         out
@@ -1325,7 +1343,14 @@ mod tests {
             let contig = CString::new("contig-1").unwrap();
             let seq = synthetic_contig(3000);
             assert_eq!(
-                sylph_index_builder_add_contig(b, name.as_ptr(), 0, contig.as_ptr(), seq.as_ptr(), seq.len()),
+                sylph_index_builder_add_contig(
+                    b,
+                    name.as_ptr(),
+                    0,
+                    contig.as_ptr(),
+                    seq.as_ptr(),
+                    seq.len()
+                ),
                 0
             );
             assert_eq!(sylph_index_builder_end_genome(b, name.as_ptr()), 0);
@@ -1365,8 +1390,14 @@ mod tests {
             let b = sylph_index_builder_create(ptr::null());
             let contig = CString::new("c").unwrap();
             let seq = synthetic_contig(100);
-            let rc =
-                sylph_index_builder_add_contig(b, ptr::null(), 0, contig.as_ptr(), seq.as_ptr(), seq.len());
+            let rc = sylph_index_builder_add_contig(
+                b,
+                ptr::null(),
+                0,
+                contig.as_ptr(),
+                seq.as_ptr(),
+                seq.len(),
+            );
             assert_eq!(rc, -1);
             sylph_index_builder_free(b);
         }
@@ -1382,13 +1413,26 @@ mod tests {
             let bb = CString::new("genome-B").unwrap();
             let c = CString::new("c").unwrap();
             let s = synthetic_contig(3000);
-            assert_eq!(sylph_index_builder_add_contig(b, a.as_ptr(), 0, c.as_ptr(), s.as_ptr(), s.len()), 0);
-            assert_eq!(sylph_index_builder_add_contig(b, bb.as_ptr(), 0, c.as_ptr(), s.as_ptr(), s.len()), 0);
-            assert_eq!(sylph_index_builder_add_contig(b, a.as_ptr(), 1, c.as_ptr(), s.as_ptr(), s.len()), 0);
+            assert_eq!(
+                sylph_index_builder_add_contig(b, a.as_ptr(), 0, c.as_ptr(), s.as_ptr(), s.len()),
+                0
+            );
+            assert_eq!(
+                sylph_index_builder_add_contig(b, bb.as_ptr(), 0, c.as_ptr(), s.as_ptr(), s.len()),
+                0
+            );
+            assert_eq!(
+                sylph_index_builder_add_contig(b, a.as_ptr(), 1, c.as_ptr(), s.as_ptr(), s.len()),
+                0
+            );
             assert_eq!(sylph_index_builder_end_genome(b, a.as_ptr()), 0);
             assert_eq!(sylph_index_builder_end_genome(b, bb.as_ptr()), 0);
             assert_eq!(sylph_index_builder_num_genomes(b), 2);
-            assert_eq!(sylph_index_builder_end_genome(b, a.as_ptr()), -1, "A already finalized");
+            assert_eq!(
+                sylph_index_builder_end_genome(b, a.as_ptr()),
+                -1,
+                "A already finalized"
+            );
             sylph_index_builder_free(b);
         }
     }
@@ -1401,7 +1445,17 @@ mod tests {
                 let b = sylph_index_builder_create(ptr::null());
                 let n = CString::new(name).unwrap();
                 let s = synthetic_contig(3000);
-                assert_eq!(sylph_index_builder_add_contig(b, n.as_ptr(), 0, n.as_ptr(), s.as_ptr(), s.len()), 0);
+                assert_eq!(
+                    sylph_index_builder_add_contig(
+                        b,
+                        n.as_ptr(),
+                        0,
+                        n.as_ptr(),
+                        s.as_ptr(),
+                        s.len()
+                    ),
+                    0
+                );
                 assert_eq!(sylph_index_builder_end_genome(b, n.as_ptr()), 0);
                 b
             };
@@ -1429,7 +1483,14 @@ mod tests {
             let contig = CString::new("c").unwrap();
             let seq = synthetic_contig(100);
             assert_eq!(
-                sylph_index_builder_add_contig(b, name.as_ptr(), 0, contig.as_ptr(), seq.as_ptr(), seq.len()),
+                sylph_index_builder_add_contig(
+                    b,
+                    name.as_ptr(),
+                    0,
+                    contig.as_ptr(),
+                    seq.as_ptr(),
+                    seq.len()
+                ),
                 0
             );
             assert_eq!(sylph_index_builder_write(b, path_c.as_ptr()), -1);
