@@ -130,7 +130,7 @@ fn minimum_ani_fraction(args: &ContainArgs) -> f64 {
 /// *dense* sketches for only the genomes that pass. The returned set is one
 /// database's contribution to the combined active-genome list the (expensive)
 /// dense profiling pass runs against.
-fn compute_dense_survivors(
+pub(crate) fn compute_dense_survivors(
     args: &ContainArgs,
     db: &TwoStageDb,
     sequence_sketch: &SequencesSketch,
@@ -575,7 +575,7 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
     log::info!("sylph finished.");
 }
 
-fn derep_if_reassign_threshold<'a>(results_old: &Vec<AniResult>, results_new: Vec<AniResult<'a>>, ani_thresh: f64, k: usize) -> Vec<AniResult<'a>>{
+pub(crate) fn derep_if_reassign_threshold<'a>(results_old: &Vec<AniResult>, results_new: Vec<AniResult<'a>>, ani_thresh: f64, k: usize) -> Vec<AniResult<'a>>{
     let ani_thresh = ani_thresh/100.;
 
     let mut gn_sketch_to_contain = FxHashMap::default();
@@ -599,7 +599,7 @@ fn derep_if_reassign_threshold<'a>(results_old: &Vec<AniResult>, results_new: Ve
     return return_vec;
 }
 
-fn estimate_true_cov(results: &mut Vec<AniResult>, kmer_id_opt: Option<f64>, 
+pub(crate) fn estimate_true_cov(results: &mut Vec<AniResult>, kmer_id_opt: Option<f64>, 
                      estimate_unknown: bool, read_length: f64, k: usize){
     let mut multiplier = 1.;
     if estimate_unknown{
@@ -613,7 +613,7 @@ fn estimate_true_cov(results: &mut Vec<AniResult>, kmer_id_opt: Option<f64>,
     }
 }
 
-fn estimate_covered_bases(results: &Vec<AniResult>, sequence_sketch: &SequencesSketch, read_length: f64, k: usize) -> f64{
+pub(crate) fn estimate_covered_bases(results: &Vec<AniResult>, sequence_sketch: &SequencesSketch, read_length: f64, k: usize) -> f64{
     let multiplier = read_length / (read_length - (k as f64) + 1.);
 
     let mut num_covered_bases = 0.;
@@ -632,7 +632,7 @@ fn estimate_covered_bases(results: &Vec<AniResult>, sequence_sketch: &SequencesS
     return f64::min(num_covered_bases as f64 / num_tentative_bases, 1.);
 }
 
-fn winner_table<'a>(results : &'a Vec<AniResult>, log_reassign: bool) -> FxHashMap<Kmer, (f64,&'a GenomeSketch, bool)> {
+pub(crate) fn winner_table<'a>(results : &'a Vec<AniResult>, log_reassign: bool) -> FxHashMap<Kmer, (f64,&'a GenomeSketch, bool)> {
     let mut kmer_to_genome_map : FxHashMap<_,_> = FxHashMap::default();
     for res in results.iter(){
         //let gn_sketch = &genome_sketches[res.genome_sketch_index];
@@ -843,7 +843,7 @@ fn get_seq_sketch(
     }
 }
 
-fn get_stats<'a>(
+pub(crate) fn get_stats<'a>(
     args: &ContainArgs,
     genome_sketch: &'a GenomeSketch,
     sequence_sketch: &SequencesSketch,
@@ -1171,7 +1171,7 @@ fn bootstrap_interval(
 }
 
 
-fn get_kmer_identity(seq_sketch: &SequencesSketch, estimate_unknown: bool) -> Option<f64>{
+pub(crate) fn get_kmer_identity(seq_sketch: &SequencesSketch, estimate_unknown: bool) -> Option<f64>{
 
     if !estimate_unknown{
         return None

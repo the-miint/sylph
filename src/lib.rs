@@ -13,4 +13,5 @@ pub mod inspect;
 #[cfg(target_arch = "x86_64")]
 pub mod avx2_seeding;
 
+pub mod profile_api;
 pub mod builders;
